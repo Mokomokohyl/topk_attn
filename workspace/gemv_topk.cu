@@ -24,6 +24,28 @@
 #define TOPK_PER_CLUSTER 512
 #define OUT_PER_HEAD (TOPC * TOPK_PER_CLUSTER)
 
+// for GeMV
+#define WEIGHT_BUFFER_LEN 32
+#define STAGE_OFFSET (WEIGHT_BUFFER_LEN / 2)
+// wrapper of cp.async
+__device__ __forceinline__ void cp_async_pred_load_128b(half* smem_ptr, const half* gmem_ptr, bool predicate) {
+    uint32_t smem_int_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
+    int src_in_bytes = predicate ? 16 : 0;
+    asm volatile("cp.async.cg.shared.global [%0], [%1], %2, %3;\n" ::"r"(smem_int_ptr),
+                "l"(gmem_ptr), "n"(16), "r"(src_in_bytes));
+}
+
+// wrapper of cp.async.commit_group
+__device__ __forceinline__ void cp_async_commit_group() {
+  asm volatile("cp.async.commit_group;\n" ::);
+}
+
+// wrapper of cp.async.wait_group
+template <size_t n>
+__device__ __forceinline__ void cp_async_wait_group() {
+  asm volatile("cp.async.wait_group %0;\n" ::"n"(n));
+}
+
 #define CUDA_CHECK(call) \
     do { \
         cudaError_t err = call; \
@@ -133,7 +155,7 @@ static bool verify_gpu_vs_cpu(const std::vector<int>& cpu_idx, const std::vector
     return all_ok;
 }
 
-// Fused kernel: one CTA per head does everything
+// ---------------- gemv_topk kernel (grid = HEAD_NUM * TOPC) ----------------
 __global__ void gemv_topk_kernel(const __half* __restrict__ kv,
                                   const __half* __restrict__ q,
                                   const __half* __restrict__ centers,
@@ -143,38 +165,79 @@ __global__ void gemv_topk_kernel(const __half* __restrict__ kv,
     const int h = g / TOPC;            // head id
     const int r_assigned = g % TOPC;   // which top-r (0..TOPC-1) this block is responsible for
     const int tid = threadIdx.x;       // thread in CTA
+    const uint32_t warp_id = tid >> 5;
+    const uint32_t lane_id = tid & 31;
+    const uint32_t input_idx = (lane_id % 16) * 8;              // head_dim
+    const uint32_t weight_idx = warp_id * 4 + lane_id / 16 * 2; // seq_len. tile_size = 16
 
-    __shared__ float q_sh[HD];
+    // gemv regs
+    half __align__(16) reg_input[8], reg_weight[8];
+    float __align__(16) qk[2];
+    // gemv k buffer
+    __shared__ half k_buffer[WEIGHT_BUFFER_LEN * HD];
+    
+    // bitonic sort buffers
     __shared__ float center_vals[32];   // pad to 32 for bitonic
     __shared__ int   center_idx[32];
     // Buffers for full bitonic sort over CLEN=2048 tokens per selected cluster
     __shared__ float cand_vals[2048];
     __shared__ int   cand_idx[2048];
-    __shared__ float red[256];          // reduction buffer (supports blockDim<=256)
 
-    // Load q into shared
-    for (int d = tid; d < HD; d += blockDim.x) {
-        q_sh[d] = __half2float(q[h * HD + d]);
-    }
-    __syncthreads();
+
+    // Load q into reg
+    *(uint4*)(&reg_input[0]) = *(uint4*)(&q[h * HD + input_idx]);
 
     // Phase 1: 使用传入的聚类中心，直接计算每个中心分数  score_c = dot(q, center[h,c,:])
-    for (int c = 0; c < CSZ; ++c) {
-        float acc = 0.f;
-        for (int d = tid; d < HD; d += blockDim.x) {
-            size_t idx = ((size_t)h * CSZ + c) * HD + d; // [HN, CSZ, HD]
-            acc += q_sh[d] * __half2float(centers[idx]);
-        }
-        // block reduce acc
-        red[tid] = acc;
-        __syncthreads();
-        for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
-            if (tid < s) red[tid] += red[tid + s];
-            __syncthreads();
-        }
-        if (tid == 0) { center_vals[c] = red[0]; center_idx[c] = c; }
-        __syncthreads();
+    for (int i = 0; i < 2; i++) {
+        cp_async_pred_load_128b(
+            &k_buffer[(weight_idx + i) * HD + input_idx],
+            &centers[h * CSZ * HD + (weight_idx + i) * HD + input_idx],
+            (weight_idx + i < CSZ)
+        );
     }
+    cp_async_commit_group();
+    for (int i = 0; i < 2; i++) {
+        cp_async_pred_load_128b(
+            &k_buffer[(STAGE_OFFSET + weight_idx + i) * HD + input_idx],
+            &centers[h * CSZ * HD + (STAGE_OFFSET + weight_idx + i) * HD + input_idx],
+            (STAGE_OFFSET + weight_idx + i < CSZ)
+        );
+    }
+    cp_async_commit_group();
+    cp_async_wait_group<1>();
+    __syncthreads();
+    for (int i = 0; i < 2; i++) {
+        *(uint4*)(&reg_weight[0]) = *(uint4*)(&k_buffer[(weight_idx + i) * HD + input_idx]);
+        qk[i] = 0.0f;
+        #pragma unroll
+        for (int d = 0; d < 8; d++) {
+            qk[i] += __half2float(reg_input[d]) * __half2float(reg_weight[d]);
+        }
+        #pragma unroll
+        for (int mask = (16 >> 1); mask > 0; mask >>= 1) {
+            qk[i] += __shfl_xor_sync(0xffffffff, qk[i], mask);
+        }
+        center_vals[weight_idx + i] = qk[i];
+        center_idx[weight_idx + i] = weight_idx + i;
+    }
+    cp_async_wait_group<0>();
+    __syncthreads();
+    for (int i = 0; i < 2; i++) {
+        *(uint4*)(&reg_weight[0]) = *(uint4*)(&k_buffer[(STAGE_OFFSET + weight_idx + i) * HD + input_idx]);
+        qk[i] = 0.0f;
+        #pragma unroll
+        for (int d = 0; d < 8; d++) {
+            qk[i] += __half2float(reg_input[d]) * __half2float(reg_weight[d]);
+        }
+        #pragma unroll
+        for (int mask = (16 >> 1); mask > 0; mask >>= 1) {
+            qk[i] += __shfl_xor_sync(0xffffffff, qk[i], mask);
+        }
+        center_vals[STAGE_OFFSET + weight_idx + i] = qk[i];
+        center_idx[STAGE_OFFSET + weight_idx + i] = STAGE_OFFSET + weight_idx + i;
+    }
+    __syncthreads();
+    
     // pad remaining slots to -inf
     if (tid < 32) {
         if (tid >= CSZ) { center_vals[tid] = -INFINITY; center_idx[tid] = -1; }
@@ -204,16 +267,65 @@ __global__ void gemv_topk_kernel(const __half* __restrict__ kv,
     // Phase 2: this block handles its assigned top-r cluster index
     int c = center_idx[r_assigned];
     // 计算所有 token 的分数：每个线程计算若干 t 并写入共享内存
-    for (int t = tid; t < CLEN; t += blockDim.x) {
-        size_t seq_idx = (size_t)c * CLEN + t;
-        float acc = 0.f;
-        #pragma unroll 4
-        for (int d = 0; d < HD; ++d) {
-            size_t idx = (seq_idx * HN + h) * HD + d;
-            acc += q_sh[d] * __half2float(kv[idx]);
+    
+    // preload k
+    int common_offset = (c * CLEN + weight_idx) * HN * HD + h * HD + input_idx;
+    for (int i = 0; i < 2; i++) {
+        cp_async_pred_load_128b(
+            &k_buffer[(weight_idx + i) * HD + input_idx],
+            &kv[common_offset + i * HN * HD],
+            true
+        );
+    }
+    cp_async_commit_group();
+    // main loop
+    for (int id = 1; id < CLEN / 16; id++) {
+        // fill current buffer
+        for (int i = 0; i < 2; i++) {
+            cp_async_pred_load_128b(
+                &k_buffer[((id % 2) * STAGE_OFFSET + weight_idx + i) * HD + input_idx],
+                &kv[common_offset + (id * 16 + i) * HN * HD],
+                true
+            );
         }
-        cand_vals[t] = acc;
-        cand_idx[t]  = t;
+        cp_async_commit_group();
+
+        // wait for last buffer
+        cp_async_wait_group<1>();
+        __syncthreads();
+        // consume last buffer
+        for (int i = 0; i < 2; i++) {
+            *(uint4*)(&reg_weight[0]) = *(uint4*)(&k_buffer[(((id - 1) % 2) * STAGE_OFFSET + weight_idx + i) * HD + input_idx]);
+            qk[i] = 0.0f;
+            #pragma unroll
+            for (int d = 0; d < 8; d++) {
+                qk[i] += __half2float(reg_input[d]) * __half2float(reg_weight[d]);
+            }
+            #pragma unroll
+            for (int mask = (16 >> 1); mask > 0; mask >>=1) {
+                qk[i] += __shfl_xor_sync(0xffffffff, qk[i], mask);
+            }
+            cand_vals[(id - 1) * 16 + weight_idx + i] = qk[i];
+            cand_idx[(id - 1) * 16 + weight_idx + i] = (id - 1) * 16 + weight_idx + i;
+        }
+    }
+    // epilogue
+    int id = CLEN / 16;
+    cp_async_wait_group<0>();
+    __syncthreads();
+    for (int i = 0; i < 2; i++) {
+        *(uint4*)(&reg_weight[0]) = *(uint4*)(&k_buffer[(((id - 1) % 2) * STAGE_OFFSET + weight_idx + i) * HD + input_idx]);
+        qk[i] = 0.0f;
+        #pragma unroll
+        for (int d = 0; d < 8; d++) {
+            qk[i] += __half2float(reg_input[d]) * __half2float(reg_weight[d]);
+        }
+        #pragma unroll
+        for (int mask = (16 >> 1); mask > 0; mask >>=1) {
+            qk[i] += __shfl_xor_sync(0xffffffff, qk[i], mask);
+        }
+        cand_vals[(id - 1) * 16 + weight_idx + i] = qk[i];
+        cand_idx[(id - 1) * 16 + weight_idx + i] = (id - 1) * 16 + weight_idx + i;
     }
     __syncthreads();
 
