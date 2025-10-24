@@ -2,3 +2,4 @@ baseline_1
 baseline_2
 gemv_topk
 flash_decoding
+gemv_profile_split

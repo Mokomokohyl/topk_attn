@@ -11,5 +11,6 @@ clean:
 	@rm -f ./baseline_1
 	@rm -f ./baseline_2
 	@rm -f ./flash_decoding
+	@rm -f ./gemv_profile_split
 
 .PHONY: gemv_topk fd s1 s2 clean
