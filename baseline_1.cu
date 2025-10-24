@@ -115,7 +115,7 @@ __global__ void gemv_topk_kernel(const __half* __restrict__ kv,
     const uint32_t weight_idx_0 = warp_id * 4 + lane_id / 16 * 2; // seq_len. tile_size = 16
     // indexes for CLEN q@k^T
     const uint32_t input_idx = (lane_id % 16) * 8;              // head_dim
-    const uint32_t weight_idx = warp_id * GEMV_NUM_ROW_PER_WARP + lane_id / 16 * GEMV_DEC_TILE; // seq_len. tile_size = 16
+    const uint32_t weight_idx = warp_id * GEMV_NUM_ROW_PER_WARP + lane_id / 16 * GEMV_DEC_TILE; // seq_len. tile_size = TILE_SIZE
 
     // gemv regs
     half __align__(16) reg_input[8], reg_weight[8];
@@ -598,7 +598,7 @@ __global__ void __cluster_dims__(CLUSTER_SIZE, 1, 1) MHAFlashDecodeKernel(
 
 // ---------------- Main: generate indices then decode ----------------
 int main(int argc, char** argv) {
-	printf("Unified baseline: HEAD_NUM=%d HEAD_DIM=%d CSZ=%d CLEN=%d OUT_PER_HEAD(SEQ_LEN)=%d FULL_KV_SEQ_LEN=%d\n",
+	printf("Baseline 1 (two seperate kernels): HEAD_NUM=%d HEAD_DIM=%d CSZ=%d CLEN=%d OUT_PER_HEAD(SEQ_LEN)=%d FULL_KV_SEQ_LEN=%d\n",
 				 HEAD_NUM, HEAD_DIM, CSZ, CLEN, OUT_PER_HEAD, FULL_KV_SEQ_LEN);
 
 	// Host buffers
@@ -646,11 +646,12 @@ int main(int argc, char** argv) {
 	CUDA_CHECK(cudaMemset(d_out, 0, sizeof(half) * (size_t)HEAD_NUM * HEAD_DIM));
 
 	// ---- Stage 1: gemv_topk to build kv_indices ----
+	int dev = 0; cudaDeviceProp prop{}; cudaGetDevice(&dev); cudaGetDeviceProperties(&prop, dev);
 	dim3 grid_topk(HEAD_NUM * TOPC), block_topk(128);
-    const size_t gemv_topk_shmem_bytes = GEMV_SHARED_BYTES;
+    uint32_t gemv_topk_shmem_bytes = GEMV_SHARED_BYTES;
     CUDA_CHECK(cudaFuncSetAttribute(gemv_topk_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(gemv_topk_shmem_bytes)));
     printf("---- Stage 1: gemv_topk to build kv_indices ----\n");
-    printf("Using %zu bytes of dynamic shared memory per block.\n", gemv_topk_shmem_bytes);
+	printf("gemv_topk requested dyn shmem: %u bytes (device optin %zu)\n", gemv_topk_shmem_bytes, (size_t)prop.sharedMemPerBlockOptin);
 	int warmup_topk = 5, iters_topk = 20; float ms_topk = 0.f;
 	for (int i = 0; i < warmup_topk; ++i) gemv_topk_kernel<<<grid_topk, block_topk, gemv_topk_shmem_bytes>>>(d_k, d_q, d_centers, d_kv_indices);
 	CUDA_CHECK(cudaDeviceSynchronize());
@@ -667,7 +668,6 @@ int main(int argc, char** argv) {
 
 	// ---- Stage 2: flash decoding ----
 	uint32_t max_shmem_size = (2 * TMA_LOAD_ONCE * HEAD_DIM + HEAD_DIM) * sizeof(half) + 2 * DIM_BLOCK_REDUCE * sizeof(float);
-	int dev = 0; cudaDeviceProp prop{}; cudaGetDevice(&dev); cudaGetDeviceProperties(&prop, dev);
     printf("---- Stage 2: flash decoding ----\n");
 	printf("Flash decode requested dyn shmem: %u bytes (device optin %zu)\n", max_shmem_size, (size_t)prop.sharedMemPerBlockOptin);
 	CUDA_TRY(cudaFuncSetAttribute(MHAFlashDecodeKernel, cudaFuncAttributeNonPortableClusterSizeAllowed, 1));
@@ -688,7 +688,7 @@ int main(int argc, char** argv) {
 	printf("flash decode latency: %.3f us\n", (ms_dec / iters_dec) * 1000.0f);
 
     // Combined latency: run gemv_topk -> flash decode sequentially
-    printf("Combined latency: run gemv_topk -> flash decode sequentially\n");
+    printf("---- Combined latency: run gemv_topk -> flash decode sequentially ----\n");
     int warmup_combo = 5, iters_combo = 50; float ms_combo = 0.f;
     for (int i = 0; i < warmup_combo; ++i) {
         gemv_topk_kernel<<<grid_topk, block_topk, gemv_topk_shmem_bytes>>>(d_k, d_q, d_centers, d_kv_indices);

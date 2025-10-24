@@ -5,7 +5,7 @@ fd:
 s1:
 	nvcc -O3 -std=c++17 -arch=sm_120a -o baseline_1 baseline_1.cu && ./baseline_1
 s2:
-	nvcc -O3 -std=c++17 -arch=sm_120a -o baseline_2 baseline_1.cu && ./baseline_2
+	nvcc -O3 -std=c++17 -arch=sm_120a -o baseline_2 baseline_2.cu && ./baseline_2
 clean:
 	@rm -f ./gemv_topk
 	@rm -f ./baseline_1
