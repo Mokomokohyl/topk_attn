@@ -796,8 +796,6 @@ __global__ void __cluster_dims__(CLUSTER_SIZE, 1, 1) topk_attn_fused_kernel(
     for (int i = tid; i < TOPK_PER_CLUSTER; i += blockDim.x) {
         int local = cand_idx[i];
         int global_idx = c * CLEN + local;
-        // int out_offset = h * OUT_PER_HEAD + r_assigned * TOPK_PER_CLUSTER + i;
-        // out_indices[out_offset] = global_idx;
         kv_indices[i] = global_idx;
     }
     __syncthreads();
@@ -1147,7 +1145,7 @@ int main(int argc, char** argv) {
         float diff = fabsf(__half2float(h_out[i]) - __half2float(h_out_fused[i]));
         if (diff > max_diff) max_diff = diff;
     }
-    printf("max abs diff between outputs: %.6f\n", max_diff);
+    printf("max abs diff between baseline_1&2 outputs: %.6f\n", max_diff);
 
 	// Cleanup
     cudaFree(d_out); cudaFree(d_kv_indices); cudaFree(d_centers); cudaFree(d_q); cudaFree(d_v); cudaFree(d_k);

@@ -237,14 +237,15 @@ __global__ void bitonic_phase_kernel(const float* __restrict__ cand_vals_in,
     __shared__ float cand_vals[CLEN];
     __shared__ int cand_idx[CLEN];
 
-    for (int i = tid; i < CLEN; i += blockDim.x) {
-        unsigned int seed = (unsigned int)(g * 0x45d9f3bu) ^ (unsigned int)(i * 0x27d4eb2du);
-        seed = 1664525u * seed + 1013904223u;
-        float val = (float)(seed & 0xFFFF) / 65535.0f - 0.5f;
-        cand_vals[i] = val;
-        cand_idx[i] = i;
-    }
-    __syncthreads();
+    // commented initialization steps
+    // for (int i = tid; i < CLEN; i += blockDim.x) {
+        // unsigned int seed = (unsigned int)(g * 0x45d9f3bu) ^ (unsigned int)(i * 0x27d4eb2du);
+        // seed = 1664525u * seed + 1013904223u;
+        // float val = (float)(seed & 0xFFFF) / 65535.0f - 0.5f;
+        // cand_vals[i] = val;
+        // cand_idx[i] = i;
+    // }
+    // __syncthreads();
 
     for (int kseq = 2; kseq <= CLEN; kseq <<= 1) {
         for (int j = kseq >> 1; j > 0; j >>= 1) {
