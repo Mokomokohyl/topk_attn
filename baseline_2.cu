@@ -39,8 +39,8 @@ namespace cg = cooperative_groups;
 // ---- Problem constants (unified across both stages) ----
 #define HEAD_DIM 128
 #define HEAD_NUM 32
-#define CSZ 20                 // number of clusters
-#define CLEN 2048              // tokens per cluster
+#define CSZ 32                 // number of clusters
+#define CLEN 1280              // tokens per cluster
 #define FULL_KV_SEQ_LEN (CSZ * CLEN)   // 40960
 #define TOPC 5
 #define TOPK_PER_CLUSTER 512

@@ -20,8 +20,8 @@
 // Problem constants (match gemv_topk.cu)
 #define HD 128
 #define HN 32
-#define CLEN 2048
-#define CSZ 20
+#define CLEN 1280
+#define CSZ 32
 #define FSL (CSZ * CLEN)
 #define TOPC 5
 #define TOPK_PER_CLUSTER 512
