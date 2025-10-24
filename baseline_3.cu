@@ -1520,8 +1520,8 @@ int main(int argc, char** argv) {
 	std::vector<half> h_k(kv_elems), h_v(kv_elems), h_q(q_elems), h_centers(center_elems);
     std::vector<half> h_out(HEAD_NUM * HEAD_DIM), h_out_fused(HEAD_NUM * HEAD_DIM), h_out_bs(HEAD_NUM * HEAD_DIM);
 	std::mt19937 rng(12345);
-	std::normal_distribution<float> noise(0.0f, 0.05f);
-	std::uniform_real_distribution<float> uni(-0.5f, 0.5f);
+	std::normal_distribution<float> noise(0.0f, 0.1f);
+	std::uniform_real_distribution<float> uni(-1.0f, 1.0f);
 
 	// centers
 	for (int h = 0; h < HEAD_NUM; ++h) for (int c = 0; c < CSZ; ++c) {
@@ -1593,6 +1593,19 @@ int main(int argc, char** argv) {
     }
     cudaEventRecord(ed_combo); cudaEventSynchronize(ed_combo); cudaEventElapsedTime(&ms_combo, st_combo, ed_combo);
     printf("baseline 1 latency: %.3f us\n", (ms_combo / iters_combo) * 1000.0f);
+
+    // Inspect top-k indices produced by baseline 1
+    std::vector<int> h_kv_indices(HEAD_NUM * OUT_PER_HEAD);
+    CUDA_CHECK(cudaMemcpy(
+        h_kv_indices.data(),
+        d_kv_indices,
+        sizeof(int) * static_cast<size_t>(HEAD_NUM) * OUT_PER_HEAD,
+        cudaMemcpyDeviceToHost));
+    printf("baseline 1 head0 kv_indices[0..15]: ");
+    for (int i = 0; i < 16; ++i) {
+        printf("%d ", h_kv_indices[i]);
+    }
+    printf("\n");
 
     // ---- Baseline 2 ----
     dim3 grid_fused(HEAD_NUM * CLUSTER_SIZE), block_fused(BLOCK_SIZE);
@@ -1667,6 +1680,18 @@ int main(int argc, char** argv) {
         float diff = fabsf(__half2float(h_out[i]) - __half2float(h_out_bs[i]));
         if (diff > max_diff) max_diff = diff;
     }
+    printf("baseline 1 head0 output[0..15]: ");
+    printf("\n");
+    for (int i = 0; i < 16; ++i) {
+        printf("%f ", __half2float(h_out[i]));
+    }
+    printf("\n");
+    printf("baseline 3 head0 output[0..15]: ");
+    printf("\n");
+    for (int i = 0; i < 16; ++i) {
+        printf("%f ", __half2float(h_out_bs[i]));
+    }
+    printf("\n");
     printf("max abs diff between baseline_1&3 outputs: %.6f\n", max_diff);
 
 	// Cleanup
