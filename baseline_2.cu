@@ -130,17 +130,12 @@ __global__ void gemv_topk_kernel(const __half* __restrict__ kv,
     float* cand_vals = reinterpret_cast<float*>(center_idx + CENTER_SORT_CAP);
     int* cand_idx = reinterpret_cast<int*>(cand_vals + CLEN);
 
-    constexpr int BLOCK_THREADS = 128;
-    constexpr int CAND_ITEMS_PER_THREAD = CLEN / BLOCK_THREADS;
-    static_assert(CLEN % BLOCK_THREADS == 0, "CLEN must be divisible by BLOCK_THREADS");
-    using CenterRadixSort = cub::BlockRadixSort<float, BLOCK_THREADS, 1, int>;
-    using CandidateRadixSort = cub::BlockRadixSort<float, BLOCK_THREADS, CAND_ITEMS_PER_THREAD, int>;
+    constexpr int CAND_ITEMS_PER_THREAD = CLEN / BLOCK_SIZE;
+    static_assert(CLEN % BLOCK_SIZE == 0, "CLEN must be divisible by BLOCK_SIZE");
+    using CenterRadixSort = cub::BlockRadixSort<float, BLOCK_SIZE, 1, int>;
+    using CandidateRadixSort = cub::BlockRadixSort<float, BLOCK_SIZE, CAND_ITEMS_PER_THREAD, int>;
     __shared__ typename CenterRadixSort::TempStorage center_sort_storage;
     __shared__ typename CandidateRadixSort::TempStorage candidate_sort_storage;
-
-    if (blockDim.x != BLOCK_THREADS) {
-        return;
-    }
 
     // Load q into reg
     *(uint4*)(&reg_input[0]) = *(uint4*)(&q[h * HEAD_DIM + input_idx_0]);
@@ -281,7 +276,7 @@ __global__ void gemv_topk_kernel(const __half* __restrict__ kv,
     }
     __syncthreads();
 
-    // 对 CLEN=2048 个候选做全量 bitonic 排序（降序）
+    // radix sort CLEN elems
     float cand_scores_local[CAND_ITEMS_PER_THREAD];
     int cand_index_local[CAND_ITEMS_PER_THREAD];
 #pragma unroll
@@ -635,17 +630,12 @@ __global__ void __cluster_dims__(CLUSTER_SIZE, 1, 1) topk_attn_fused_kernel(
     const uint32_t cluster_head_idx = head_id * HEAD_DIM;
 
     // for cub::BlockRadixSort
-    constexpr int BLOCK_THREADS = 128;
-    constexpr int CAND_ITEMS_PER_THREAD = CLEN / BLOCK_THREADS;
-    static_assert(CLEN % BLOCK_THREADS == 0, "CLEN must be divisible by BLOCK_THREADS");
-    using CenterRadixSort = cub::BlockRadixSort<float, BLOCK_THREADS, 1, int>;
-    using CandidateRadixSort = cub::BlockRadixSort<float, BLOCK_THREADS, CAND_ITEMS_PER_THREAD, int>;
+    constexpr int CAND_ITEMS_PER_THREAD = CLEN / BLOCK_SIZE;
+    static_assert(CLEN % BLOCK_SIZE == 0, "CLEN must be divisible by BLOCK_SIZE");
+    using CenterRadixSort = cub::BlockRadixSort<float, BLOCK_SIZE, 1, int>;
+    using CandidateRadixSort = cub::BlockRadixSort<float, BLOCK_SIZE, CAND_ITEMS_PER_THREAD, int>;
     __shared__ typename CenterRadixSort::TempStorage center_sort_storage;
     __shared__ typename CandidateRadixSort::TempStorage candidate_sort_storage;
-
-    if (blockDim.x != BLOCK_THREADS) {
-        return;
-    }
     
     // Load q into reg_input
     *(uint4*)(&reg_input[0]) = *(uint4*)(&q[cluster_head_idx + input_idx]);
@@ -708,7 +698,7 @@ __global__ void __cluster_dims__(CLUSTER_SIZE, 1, 1) topk_attn_fused_kernel(
     }
     __syncthreads();
 
-    // Radix sort
+    // Radix sort center scores
     float center_score_arr[1];
     int center_id_arr[1];
     center_score_arr[0] = (tid < CENTER_SORT_CAP) ? center_vals[tid] : -INFINITY;
@@ -787,7 +777,7 @@ __global__ void __cluster_dims__(CLUSTER_SIZE, 1, 1) topk_attn_fused_kernel(
     }
     __syncthreads();
 
-    // radix sort 2048 elems
+    // Radix sort CLEN elems
     float cand_scores_local[CAND_ITEMS_PER_THREAD];
     int cand_index_local[CAND_ITEMS_PER_THREAD];
 #pragma unroll

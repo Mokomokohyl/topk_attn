@@ -15,6 +15,7 @@
 #include <string.h>
 #include <numeric>
 #include <cub/block/block_radix_sort.cuh>
+#include <stdint.h>
 
 // Problem constants (match gemv_topk.cu)
 #define HD 128
@@ -32,6 +33,13 @@
 #define GEMV_NUM_ROW_PER_WARP (GEMV_TILE_SIZE / 4)
 #define GEMV_DEC_TILE (GEMV_NUM_ROW_PER_WARP / 2)
 static constexpr int CENTER_SORT_CAP = 32;
+static constexpr size_t GEMV_SHARED_K_BUFFER_ELEMS = static_cast<size_t>(GEMV_WEIGHT_BUFFER_LEN) * HD;
+static constexpr size_t GEMV_SHARED_BYTES =
+    sizeof(half) * GEMV_SHARED_K_BUFFER_ELEMS +
+    sizeof(float) * CENTER_SORT_CAP +
+    sizeof(int) * CENTER_SORT_CAP +
+    sizeof(float) * CLEN +
+    sizeof(int) * CLEN;
 
 __device__ __forceinline__ void cp_async_pred_load_128b(half* smem_ptr, const half* gmem_ptr, bool predicate) {
     uint32_t smem_int_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
@@ -73,19 +81,16 @@ __global__ void gemv_phase_kernel(const __half* __restrict__ kv,
     const uint32_t input_idx = (lane_id % 16) * 8;
     const uint32_t weight_idx = warp_id * 4 + (lane_id / 16) * 2;
 
-    __shared__ float center_vals[32];
-    __shared__ int center_idx[32];
-    __shared__ float cand_vals[CLEN];
-    __shared__ int cand_idx[CLEN];
-    __shared__ half k_buffer[GEMV_WEIGHT_BUFFER_LEN * HD];
+    extern __shared__ __align__(16) unsigned char shared_storage[];
+    half* k_buffer = reinterpret_cast<half*>(shared_storage);
+    float* center_vals = reinterpret_cast<float*>(k_buffer + GEMV_SHARED_K_BUFFER_ELEMS);
+    int* center_idx = reinterpret_cast<int*>(center_vals + CENTER_SORT_CAP);
+    float* cand_vals = reinterpret_cast<float*>(center_idx + CENTER_SORT_CAP);
+    int* cand_idx = reinterpret_cast<int*>(cand_vals + CLEN);
 
     constexpr int BLOCK_THREADS = 128;
-    constexpr int CAND_ITEMS_PER_THREAD = CLEN / BLOCK_THREADS;
-    static_assert(CLEN % BLOCK_THREADS == 0, "CLEN must be divisible by BLOCK_THREADS");
     using CenterRadixSort = cub::BlockRadixSort<float, BLOCK_THREADS, 1, int>;
-    using CandidateRadixSort = cub::BlockRadixSort<float, BLOCK_THREADS, CAND_ITEMS_PER_THREAD, int>;
     __shared__ typename CenterRadixSort::TempStorage center_sort_storage;
-    __shared__ typename CandidateRadixSort::TempStorage candidate_sort_storage;
 
     if (blockDim.x != BLOCK_THREADS) {
         return;
@@ -236,7 +241,14 @@ __global__ void gemv_phase_kernel(const __half* __restrict__ kv,
     }
     __syncthreads();
 
-    // skip write to global.
+    int out_base = g * CLEN;
+    for (int i = tid; i < CLEN; i += blockDim.x) {
+        cand_vals_out[out_base + i] = cand_vals[i];
+        cand_idx_out[out_base + i] = cand_idx[i];
+    }
+    if (tid == 0) {
+        chosen_centers[g] = c;
+    }
 }
 
 // ---------------- Bitonic phase kernel ----------------
@@ -249,23 +261,25 @@ __global__ void bitonic_phase_kernel(const float* __restrict__ cand_vals_in,
     const int r_assigned = g % TOPC;
     const int tid = threadIdx.x;
 
-    (void)cand_vals_in;
-    (void)cand_idx_in;
-
     __shared__ float cand_vals[CLEN];
     __shared__ int cand_idx[CLEN];
 
     constexpr int BLOCK_THREADS = 128;
     constexpr int CAND_ITEMS_PER_THREAD = CLEN / BLOCK_THREADS;
     static_assert(CLEN % BLOCK_THREADS == 0, "CLEN must be divisible by BLOCK_THREADS");
-    using CenterRadixSort = cub::BlockRadixSort<float, BLOCK_THREADS, 1, int>;
     using CandidateRadixSort = cub::BlockRadixSort<float, BLOCK_THREADS, CAND_ITEMS_PER_THREAD, int>;
-    __shared__ typename CenterRadixSort::TempStorage center_sort_storage;
     __shared__ typename CandidateRadixSort::TempStorage candidate_sort_storage;
 
     if (blockDim.x != BLOCK_THREADS) {
         return;
     }
+
+    int cand_base = g * CLEN;
+    for (int i = tid; i < CLEN; i += blockDim.x) {
+        cand_vals[i] = cand_vals_in[cand_base + i];
+        cand_idx[i] = cand_idx_in[cand_base + i];
+    }
+    __syncthreads();
 
     // commented initialization steps
     // for (int i = tid; i < CLEN; i += blockDim.x) {
@@ -297,6 +311,9 @@ __global__ void bitonic_phase_kernel(const float* __restrict__ cand_vals_in,
     __syncthreads();
 
     int c = chosen_centers[g];
+    if (c < 0) {
+        return;
+    }
     for (int i = tid; i < TOPK_PER_CLUSTER; i += blockDim.x) {
         int local = cand_idx[i];
         int global_idx = c * CLEN + local;
@@ -382,8 +399,13 @@ int main(int argc, char** argv) {
     dim3 grid(HN * TOPC);
     dim3 block(128);
 
+    CUDA_CHECK(cudaFuncSetAttribute(gemv_phase_kernel,
+                                    cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                    static_cast<int>(GEMV_SHARED_BYTES)));
+
     for (int i = 0; i < warmup; ++i) {
-        gemv_phase_kernel<<<grid, block>>>(d_kv, d_q, d_centers, d_cand_vals, d_cand_idx, d_chosen_centers);
+        gemv_phase_kernel<<<grid, block, GEMV_SHARED_BYTES>>>(d_kv, d_q, d_centers,
+                                                              d_cand_vals, d_cand_idx, d_chosen_centers);
     }
     CUDA_CHECK(cudaDeviceSynchronize());
 
@@ -393,7 +415,8 @@ int main(int argc, char** argv) {
 
     CUDA_CHECK(cudaEventRecord(st));
     for (int i = 0; i < iters; ++i) {
-        gemv_phase_kernel<<<grid, block>>>(d_kv, d_q, d_centers, d_cand_vals, d_cand_idx, d_chosen_centers);
+        gemv_phase_kernel<<<grid, block, GEMV_SHARED_BYTES>>>(d_kv, d_q, d_centers,
+                                                              d_cand_vals, d_cand_idx, d_chosen_centers);
     }
     CUDA_CHECK(cudaEventRecord(ed));
     CUDA_CHECK(cudaEventSynchronize(ed));
