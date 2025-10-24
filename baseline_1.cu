@@ -60,7 +60,7 @@ static constexpr size_t GEMV_SHARED_BYTES =
 
 // ---- Flash decoding constants ----
 #define SEQ_LEN OUT_PER_HEAD
-#define CLUSTER_SIZE 4
+#define CLUSTER_SIZE 5
 #define KV_DIM_PER_BLOCK (SEQ_LEN / CLUSTER_SIZE) // 640
 
 #define NUM_WARPS 4
@@ -71,7 +71,7 @@ static constexpr size_t GEMV_SHARED_BYTES =
 #define NUM_THREAD_PER_ROW (WARP_SIZE / NUM_ROW_PER_WARP)
 #define NUM_PER_ROW (NUM_PER_THREAD * NUM_THREAD_PER_ROW)
 
-#define TMA_LOAD_ONCE 32
+#define TMA_LOAD_ONCE 64
 #define TMA_LOAD_ONCE_MAX 256
 #define TMA_LOAD_ONCE_NUM (TMA_LOAD_ONCE * HEAD_DIM)
 #define TMA_LOAD_ONCE_SIZE (TMA_LOAD_ONCE_NUM * sizeof(half))
@@ -334,20 +334,20 @@ __global__ void __cluster_dims__(CLUSTER_SIZE, 1, 1) MHAFlashDecodeKernel(
     __shared__ float cluster_local_sum, cluster_local_max;
 
     // Init barrier
-    #pragma nv_diag_suppress static_var_with_dynamic_init
-    __shared__ barrier bar[4];
-    __shared__ uint64_t barrier;
-    uint32_t bar_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(&barrier));
-    if (tid == 0) {
-        init(&bar[0], blockDim.x);
-        cde::fence_proxy_async_shared_cta();
-        init(&bar[1], blockDim.x);
-        cde::fence_proxy_async_shared_cta();
-        init(&bar[2], blockDim.x);
-        cde::fence_proxy_async_shared_cta();
-        init(&bar[3], blockDim.x);
-        cde::fence_proxy_async_shared_cta();
-    }
+    // #pragma nv_diag_suppress static_var_with_dynamic_init
+    // __shared__ barrier bar[4];
+    // __shared__ uint64_t barrier;
+    // uint32_t bar_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(&barrier));
+    // if (tid == 0) {
+        // init(&bar[0], blockDim.x);
+        // cde::fence_proxy_async_shared_cta();
+        // init(&bar[1], blockDim.x);
+        // cde::fence_proxy_async_shared_cta();
+        // init(&bar[2], blockDim.x);
+        // cde::fence_proxy_async_shared_cta();
+        // init(&bar[3], blockDim.x);
+        // cde::fence_proxy_async_shared_cta();
+    // }
     block.sync();
 
     // Init registers
@@ -649,6 +649,7 @@ int main(int argc, char** argv) {
 	dim3 grid_topk(HEAD_NUM * TOPC), block_topk(128);
     const size_t gemv_topk_shmem_bytes = GEMV_SHARED_BYTES;
     CUDA_CHECK(cudaFuncSetAttribute(gemv_topk_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(gemv_topk_shmem_bytes)));
+    printf("---- Stage 1: gemv_topk to build kv_indices ----\n");
     printf("Using %zu bytes of dynamic shared memory per block.\n", gemv_topk_shmem_bytes);
 	int warmup_topk = 5, iters_topk = 20; float ms_topk = 0.f;
 	for (int i = 0; i < warmup_topk; ++i) gemv_topk_kernel<<<grid_topk, block_topk, gemv_topk_shmem_bytes>>>(d_k, d_q, d_centers, d_kv_indices);
@@ -667,6 +668,7 @@ int main(int argc, char** argv) {
 	// ---- Stage 2: flash decoding ----
 	uint32_t max_shmem_size = (2 * TMA_LOAD_ONCE * HEAD_DIM + HEAD_DIM) * sizeof(half) + 2 * DIM_BLOCK_REDUCE * sizeof(float);
 	int dev = 0; cudaDeviceProp prop{}; cudaGetDevice(&dev); cudaGetDeviceProperties(&prop, dev);
+    printf("---- Stage 2: flash decoding ----\n");
 	printf("Flash decode requested dyn shmem: %u bytes (device optin %zu)\n", max_shmem_size, (size_t)prop.sharedMemPerBlockOptin);
 	CUDA_TRY(cudaFuncSetAttribute(MHAFlashDecodeKernel, cudaFuncAttributeNonPortableClusterSizeAllowed, 1));
 	CUDA_TRY(cudaFuncSetAttribute(MHAFlashDecodeKernel, cudaFuncAttributeMaxDynamicSharedMemorySize, max_shmem_size));
@@ -686,6 +688,7 @@ int main(int argc, char** argv) {
 	printf("flash decode latency: %.3f us\n", (ms_dec / iters_dec) * 1000.0f);
 
     // Combined latency: run gemv_topk -> flash decode sequentially
+    printf("Combined latency: run gemv_topk -> flash decode sequentially\n");
     int warmup_combo = 5, iters_combo = 50; float ms_combo = 0.f;
     for (int i = 0; i < warmup_combo; ++i) {
         gemv_topk_kernel<<<grid_topk, block_topk, gemv_topk_shmem_bytes>>>(d_k, d_q, d_centers, d_kv_indices);

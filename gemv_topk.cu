@@ -25,12 +25,12 @@
 #define OUT_PER_HEAD (TOPC * TOPK_PER_CLUSTER)
 
 // for GeMV
-#define TILE_SIZE 32
-#define WEIGHT_BUFFER_LEN (TILE_SIZE * 2)
-#define NUM_ROW_PER_WARP (TILE_SIZE / 4)
-#define DEC_TILE (NUM_ROW_PER_WARP / 2)
+#define GEMV_TILE_SIZE 32
+#define GEMV_WEIGHT_BUFFER_LEN (GEMV_TILE_SIZE * 2)
+#define GEMV_NUM_ROW_PER_WARP (GEMV_TILE_SIZE / 4)
+#define GEMV_DEC_TILE (GEMV_NUM_ROW_PER_WARP / 2)
 static constexpr int CENTER_SORT_CAP = 32;
-static constexpr size_t GEMV_SHARED_K_BUFFER_ELEMS = static_cast<size_t>(WEIGHT_BUFFER_LEN) * HD;
+static constexpr size_t GEMV_SHARED_K_BUFFER_ELEMS = static_cast<size_t>(GEMV_WEIGHT_BUFFER_LEN) * HD;
 static constexpr size_t GEMV_SHARED_BYTES =
     sizeof(half) * GEMV_SHARED_K_BUFFER_ELEMS +
     sizeof(float) * CENTER_SORT_CAP +
@@ -182,11 +182,11 @@ __global__ void gemv_topk_kernel(const __half* __restrict__ kv,
     const uint32_t weight_idx_0 = warp_id * 4 + lane_id / 16 * 2; // seq_len. tile_size = 16
     // indexes for CLEN q@k^T
     const uint32_t input_idx = (lane_id % 16) * 8;              // head_dim
-    const uint32_t weight_idx = warp_id * NUM_ROW_PER_WARP + lane_id / 16 * DEC_TILE; // seq_len. tile_size = 16
+    const uint32_t weight_idx = warp_id * GEMV_NUM_ROW_PER_WARP + lane_id / 16 * GEMV_DEC_TILE; // seq_len. tile_size = 16
 
     // gemv regs
     half __align__(16) reg_input[8], reg_weight[8];
-    float __align__(16) qk[DEC_TILE];
+    float __align__(16) qk[GEMV_DEC_TILE];
     // dynamic shared memory buffers
     extern __shared__ __align__(16) unsigned char shared_storage[];
     half* k_buffer = reinterpret_cast<half*>(shared_storage);
@@ -282,7 +282,7 @@ __global__ void gemv_topk_kernel(const __half* __restrict__ kv,
     
     // preload k
     int common_offset = (c * CLEN + weight_idx) * HN * HD + h * HD + input_idx;
-    for (int i = 0; i < DEC_TILE; i++) {
+    for (int i = 0; i < GEMV_DEC_TILE; i++) {
         cp_async_pred_load_128b(
             &k_buffer[(weight_idx + i) * HD + input_idx],
             &kv[common_offset + i * HN * HD],
@@ -291,12 +291,12 @@ __global__ void gemv_topk_kernel(const __half* __restrict__ kv,
     }
     cp_async_commit_group();
     // main loop
-    for (int id = 1; id < CLEN / TILE_SIZE; id++) {
+    for (int id = 1; id < CLEN / GEMV_TILE_SIZE; id++) {
         // fill current buffer
-        for (int i = 0; i < DEC_TILE; i++) {
+        for (int i = 0; i < GEMV_DEC_TILE; i++) {
             cp_async_pred_load_128b(
-                &k_buffer[((id % 2) * TILE_SIZE + weight_idx + i) * HD + input_idx],
-                &kv[common_offset + (id * TILE_SIZE + i) * HN * HD],
+                &k_buffer[((id % 2) * GEMV_TILE_SIZE + weight_idx + i) * HD + input_idx],
+                &kv[common_offset + (id * GEMV_TILE_SIZE + i) * HN * HD],
                 true
             );
         }
@@ -306,8 +306,8 @@ __global__ void gemv_topk_kernel(const __half* __restrict__ kv,
         cp_async_wait_group<1>();
         __syncthreads();
         // consume last buffer
-        for (int i = 0; i < DEC_TILE; i++) {
-            *(uint4*)(&reg_weight[0]) = *(uint4*)(&k_buffer[(((id - 1) % 2) * TILE_SIZE + weight_idx + i) * HD + input_idx]);
+        for (int i = 0; i < GEMV_DEC_TILE; i++) {
+            *(uint4*)(&reg_weight[0]) = *(uint4*)(&k_buffer[(((id - 1) % 2) * GEMV_TILE_SIZE + weight_idx + i) * HD + input_idx]);
             qk[i] = 0.0f;
             #pragma unroll
             for (int d = 0; d < 8; d++) {
@@ -317,16 +317,16 @@ __global__ void gemv_topk_kernel(const __half* __restrict__ kv,
             for (int mask = (16 >> 1); mask > 0; mask >>=1) {
                 qk[i] += __shfl_xor_sync(0xffffffff, qk[i], mask);
             }
-            cand_vals[(id - 1) * TILE_SIZE + weight_idx + i] = qk[i];
-            cand_idx[(id - 1) * TILE_SIZE + weight_idx + i] = (id - 1) * TILE_SIZE + weight_idx + i;
+            cand_vals[(id - 1) * GEMV_TILE_SIZE + weight_idx + i] = qk[i];
+            cand_idx[(id - 1) * GEMV_TILE_SIZE + weight_idx + i] = (id - 1) * GEMV_TILE_SIZE + weight_idx + i;
         }
     }
     // epilogue
-    int id = CLEN / TILE_SIZE;
+    int id = CLEN / GEMV_TILE_SIZE;
     cp_async_wait_group<0>();
     __syncthreads();
-    for (int i = 0; i < DEC_TILE; i++) {
-        *(uint4*)(&reg_weight[0]) = *(uint4*)(&k_buffer[(((id - 1) % 2) * TILE_SIZE + weight_idx + i) * HD + input_idx]);
+    for (int i = 0; i < GEMV_DEC_TILE; i++) {
+        *(uint4*)(&reg_weight[0]) = *(uint4*)(&k_buffer[(((id - 1) % 2) * GEMV_TILE_SIZE + weight_idx + i) * HD + input_idx]);
         qk[i] = 0.0f;
         #pragma unroll
         for (int d = 0; d < 8; d++) {
@@ -336,8 +336,8 @@ __global__ void gemv_topk_kernel(const __half* __restrict__ kv,
         for (int mask = (16 >> 1); mask > 0; mask >>=1) {
             qk[i] += __shfl_xor_sync(0xffffffff, qk[i], mask);
         }
-        cand_vals[(id - 1) * TILE_SIZE + weight_idx + i] = qk[i];
-        cand_idx[(id - 1) * TILE_SIZE + weight_idx + i] = (id - 1) * TILE_SIZE + weight_idx + i;
+        cand_vals[(id - 1) * GEMV_TILE_SIZE + weight_idx + i] = qk[i];
+        cand_idx[(id - 1) * GEMV_TILE_SIZE + weight_idx + i] = (id - 1) * GEMV_TILE_SIZE + weight_idx + i;
     }
     __syncthreads();
 
