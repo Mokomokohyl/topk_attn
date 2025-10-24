@@ -1,4 +1,4 @@
-// nvcc -O3 -std=c++17 -arch=sm_120a -o baseline_1 baseline_1.cu && ./baseline_1
+// nvcc -O3 -std=c++17 -arch=sm_120a -o baseline_2 baseline_2.cu && ./baseline_2
 
 #include <iostream>
 #include <cuda.h>
@@ -583,20 +583,12 @@ __global__ void __cluster_dims__(CLUSTER_SIZE, 1, 1) MHAFlashDecodeKernel(
     }
     block.sync();
 
-    // // ClusterReduce
-    // size = HEAD_DIM * sizeof(half);
-    // src_addr = static_cast<uint32_t>(__cvta_generic_to_shared(&local_qkv[2 * HEAD_DIM]));
-    // dst_addr = static_cast<uint32_t>(__cvta_generic_to_shared(weight));
-    // cluster_reduce<CLUSTER_SIZE, Stage::ATTN>(
-        // size, tid, HEAD_DIM, cluster_block_id,  
-        // src_addr, dst_addr, bar_ptr, 
-        // neighbor_dst_bar, &local_qkv[2 * HEAD_DIM], weight);
     atomicAdd(&output[head_id * HEAD_DIM + tid], local_output[tid]);
 }
 
 // ---------------- Main: generate indices then decode ----------------
 int main(int argc, char** argv) {
-	printf("Baseline 1 (two seperate kernels): HEAD_NUM=%d HEAD_DIM=%d CSZ=%d CLEN=%d OUT_PER_HEAD(SEQ_LEN)=%d FULL_KV_SEQ_LEN=%d\n",
+	printf("Baseline 2 (directly fused topk-attn kernel): HEAD_NUM=%d HEAD_DIM=%d CSZ=%d CLEN=%d OUT_PER_HEAD(SEQ_LEN)=%d FULL_KV_SEQ_LEN=%d\n",
 				 HEAD_NUM, HEAD_DIM, CSZ, CLEN, OUT_PER_HEAD, FULL_KV_SEQ_LEN);
 
 	// Host buffers
@@ -631,6 +623,8 @@ int main(int argc, char** argv) {
 
 	// Device buffers
 	half *d_k=nullptr, *d_v=nullptr, *d_q=nullptr, *d_centers=nullptr; int *d_kv_indices=nullptr; half *d_out=nullptr;
+    // for baseline 2
+    half *d_out_2=nullptr;
 	CUDA_CHECK(cudaMalloc(&d_k, sizeof(half) * kv_elems));
 	CUDA_CHECK(cudaMalloc(&d_v,  sizeof(half) * kv_elems));
 	CUDA_CHECK(cudaMalloc(&d_q,  sizeof(half) * q_elems));
@@ -642,51 +636,24 @@ int main(int argc, char** argv) {
 	CUDA_CHECK(cudaMemcpy(d_q,  h_q.data(),  sizeof(half) * q_elems,  cudaMemcpyHostToDevice));
 	CUDA_CHECK(cudaMemcpy(d_centers, h_centers.data(), sizeof(half) * center_elems, cudaMemcpyHostToDevice));
 	CUDA_CHECK(cudaMemset(d_out, 0, sizeof(half) * (size_t)HEAD_NUM * HEAD_DIM));
+    // for baseline 2
+	CUDA_CHECK(cudaMalloc(&d_out_2, sizeof(half) * (size_t)HEAD_NUM * HEAD_DIM));
+	CUDA_CHECK(cudaMemset(d_out_2, 0, sizeof(half) * (size_t)HEAD_NUM * HEAD_DIM));
 
-	// ---- Stage 1: gemv_topk to build kv_indices ----
+	// ---- Baseline 1 for reference ----
+    // grid & block & dynamic shared memory config
 	int dev = 0; cudaDeviceProp prop{}; cudaGetDevice(&dev); cudaGetDeviceProperties(&prop, dev);
+    // topk kernel
 	dim3 grid_topk(HEAD_NUM * TOPC), block_topk(128);
     uint32_t gemv_topk_shmem_bytes = GEMV_SHARED_BYTES;
     CUDA_CHECK(cudaFuncSetAttribute(gemv_topk_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(gemv_topk_shmem_bytes)));
-    printf("---- Stage 1: gemv_topk to build kv_indices ----\n");
-	printf("gemv_topk requested dyn shmem: %u bytes (device optin %zu)\n", gemv_topk_shmem_bytes, (size_t)prop.sharedMemPerBlockOptin);
-	int warmup_topk = 5, iters_topk = 20; float ms_topk = 0.f;
-	for (int i = 0; i < warmup_topk; ++i) gemv_topk_kernel<<<grid_topk, block_topk, gemv_topk_shmem_bytes>>>(d_k, d_q, d_centers, d_kv_indices);
-	CUDA_CHECK(cudaDeviceSynchronize());
-	cudaEvent_t st1, ed1; cudaEventCreate(&st1); cudaEventCreate(&ed1);
-	cudaEventRecord(st1);
-    for (int i = 0; i < iters_topk; ++i) gemv_topk_kernel<<<grid_topk, block_topk, gemv_topk_shmem_bytes>>>(d_k, d_q, d_centers, d_kv_indices);
-	cudaEventRecord(ed1); cudaEventSynchronize(ed1); cudaEventElapsedTime(&ms_topk, st1, ed1);
-	printf("gemv_topk (indices build) latency: %.3f us\n", (ms_topk / iters_topk) * 1000.0f);
-
-	// Optional: inspect first 16 indices of head0
-	std::vector<int> h_idx(OUT_PER_HEAD * HEAD_NUM);
-	CUDA_CHECK(cudaMemcpy(h_idx.data(), d_kv_indices, sizeof(int) * (size_t)HEAD_NUM * OUT_PER_HEAD, cudaMemcpyDeviceToHost));
-	printf("head0 kv_indices[0..15]: "); for (int i = 0; i < 16; ++i) printf("%d ", h_idx[i]); printf("\n");
-
-	// ---- Stage 2: flash decoding ----
+    // attn kernel
+	dim3 grid_dec(HEAD_NUM * CLUSTER_SIZE), block_dec(BLOCK_SIZE);
 	uint32_t max_shmem_size = (2 * TMA_LOAD_ONCE * HEAD_DIM + HEAD_DIM) * sizeof(half) + 2 * DIM_BLOCK_REDUCE * sizeof(float);
-    printf("---- Stage 2: flash decoding ----\n");
-	printf("Flash decode requested dyn shmem: %u bytes (device optin %zu)\n", max_shmem_size, (size_t)prop.sharedMemPerBlockOptin);
 	CUDA_TRY(cudaFuncSetAttribute(MHAFlashDecodeKernel, cudaFuncAttributeNonPortableClusterSizeAllowed, 1));
 	CUDA_TRY(cudaFuncSetAttribute(MHAFlashDecodeKernel, cudaFuncAttributeMaxDynamicSharedMemorySize, max_shmem_size));
-
-	dim3 grid_dec(HEAD_NUM * CLUSTER_SIZE), block_dec(BLOCK_SIZE);
-	int warmup_dec = 10, iters_dec = 50; float ms_dec = 0.f;
-	for (int i = 0; i < warmup_dec; ++i) {
-		MHAFlashDecodeKernel<<<grid_dec, block_dec, max_shmem_size>>>(d_out, d_q, d_k, d_v, d_kv_indices);
-	}
-	CUDA_CHECK(cudaDeviceSynchronize());
-	cudaEvent_t st2, ed2; cudaEventCreate(&st2); cudaEventCreate(&ed2);
-	cudaEventRecord(st2);
-	for (int i = 0; i < iters_dec; ++i) {
-		MHAFlashDecodeKernel<<<grid_dec, block_dec, max_shmem_size>>>(d_out, d_q, d_k, d_v, d_kv_indices);
-	}
-	cudaEventRecord(ed2); cudaEventSynchronize(ed2); cudaEventElapsedTime(&ms_dec, st2, ed2);
-	printf("flash decode latency: %.3f us\n", (ms_dec / iters_dec) * 1000.0f);
-
     // Combined latency: run gemv_topk -> flash decode sequentially
-    printf("---- Combined latency: run gemv_topk -> flash decode sequentially ----\n");
+    printf("---- Baseline 1 latency test ----\n");
     int warmup_combo = 5, iters_combo = 50; float ms_combo = 0.f;
     for (int i = 0; i < warmup_combo; ++i) {
         gemv_topk_kernel<<<grid_topk, block_topk, gemv_topk_shmem_bytes>>>(d_k, d_q, d_centers, d_kv_indices);
@@ -700,7 +667,7 @@ int main(int argc, char** argv) {
         MHAFlashDecodeKernel<<<grid_dec, block_dec, max_shmem_size>>>(d_out, d_q, d_k, d_v, d_kv_indices);
     }
     cudaEventRecord(ed_combo); cudaEventSynchronize(ed_combo); cudaEventElapsedTime(&ms_combo, st_combo, ed_combo);
-    printf("gemv_topk + flash decode latency: %.3f us\n", (ms_combo / iters_combo) * 1000.0f);
+    printf("baseline 1 latency: %.3f us\n", (ms_combo / iters_combo) * 1000.0f);
 
 	// Cleanup
 	cudaFree(d_out); cudaFree(d_kv_indices); cudaFree(d_centers); cudaFree(d_q); cudaFree(d_v); cudaFree(d_k);
