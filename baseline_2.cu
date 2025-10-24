@@ -537,9 +537,8 @@ __global__ void __cluster_dims__(CLUSTER_SIZE, 1, 1) MHAFlashDecodeKernel(
     }
     cluster.sync();
     // ClusterReduce: local_max
-    for (int i = 1; i < cluster.num_blocks() - 1; i++) {
+    for (int i = 1; i < cluster.num_blocks(); i++) {
         if (tid == 0) {
-            local_max = cluster_local_max;
             int dst_cta = (cluster_block_id + i) % cluster.num_blocks();
             dst_shmem = cluster.map_shared_rank(&cluster_local_max, dst_cta);  
         }
@@ -561,9 +560,8 @@ __global__ void __cluster_dims__(CLUSTER_SIZE, 1, 1) MHAFlashDecodeKernel(
     }
     cluster.sync();
     // ClusterReduce: local_sum
-    for (int i = 1; i < cluster.num_blocks() - 1; i++) {
+    for (int i = 1; i < cluster.num_blocks(); i++) {
         if (tid == 0) {
-            local_sum = cluster_local_sum;
             int dst_cta = (cluster_block_id + i) % cluster.num_blocks();
             dst_shmem = cluster.map_shared_rank(&cluster_local_sum, dst_cta);  
         }
