@@ -100,6 +100,10 @@ __device__ __forceinline__ void cp_async_commit_group() { asm volatile("cp.async
 template <size_t n>
 __device__ __forceinline__ void cp_async_wait_group() { asm volatile("cp.async.wait_group %0;\n" ::"n"(n)); }
 
+// ##########################################
+// #  Baseline 1: topk kernel + attn kernel #
+// ##########################################
+
 // ---------------- gemv_topk kernel (grid = HEAD_NUM * TOPC) ----------------
 __global__ void gemv_topk_kernel(const __half* __restrict__ kv,
                                   const __half* __restrict__ q,
@@ -572,6 +576,10 @@ __global__ void __cluster_dims__(CLUSTER_SIZE, 1, 1) MHAFlashDecodeKernel(
     atomicAdd(&output[head_id * HEAD_DIM + tid], local_output[tid]);
 }
 
+// ################################################
+// #  Baseline 2: topk_attn directly fused kernel #
+// ################################################
+
 __global__ void __cluster_dims__(CLUSTER_SIZE, 1, 1) topk_attn_fused_kernel(
     half* output,        // [H, D]
     const __half* __restrict__ k_cache,
@@ -1027,13 +1035,16 @@ __global__ void __cluster_dims__(CLUSTER_SIZE, 1, 1) topk_attn_fused_kernel(
     atomicAdd(&output[head_id * HEAD_DIM + tid], local_output[tid]);
 }
 
+// ######################################################
+// #  Baseline 3: topk_attn block specialization kernel #
+// ######################################################
+
 __global__ void __cluster_dims__(CLUSTER_SIZE, 1, 1) topk_attn_block_specialization_kernel(
     half* output,        // [H, D]
     const __half* __restrict__ k_cache,
     const __half* __restrict__ v_cache,
     const __half* __restrict__ q,
     const __half* __restrict__ centers) {
-    // flash decoding setup
     cg::grid_group grid             = cg::this_grid();
     cg::cluster_group cluster       = cg::this_cluster();
     cg::thread_block block          = cg::this_thread_block();
@@ -1041,46 +1052,36 @@ __global__ void __cluster_dims__(CLUSTER_SIZE, 1, 1) topk_attn_block_specializat
     const uint32_t head_id          = grid.cluster_rank() % HEAD_NUM;
     const uint32_t cluster_block_id = cluster.block_rank();
     const uint32_t tid              = block.thread_rank();
+    // common indices
     const uint32_t lane_id = tid % 32; 
     const uint32_t warp_id = tid / 32;
     const uint32_t tile_row = tid / 16;
     const uint32_t tile_col = tid % 16;
+    const uint32_t input_idx = (lane_id % 16) * 8;                // head_dim
+    const uint32_t cluster_head_idx = head_id * HEAD_DIM;
 
     // Init shared memory
+    // store selected kv indices in shared memory
+    __shared__ int kv_indices[TOPC * TOPK_PER_CLUSTER];
+
     extern __shared__ uint8_t shmem_base[];
-    // gemv-topk
+    if (cluster_block_id == CLUSTER_SIZE - 1) {
+// begin gemv_topk block 
+    // Init shared memory
     half* k_buffer = reinterpret_cast<half*>(shmem_base);
     float* center_vals = reinterpret_cast<float*>(k_buffer + GEMV_SHARED_K_BUFFER_ELEMS);
     int* center_idx = reinterpret_cast<int*>(center_vals + CENTER_SORT_CAP);
     float* cand_vals = reinterpret_cast<float*>(center_idx + CENTER_SORT_CAP);
     int* cand_idx = reinterpret_cast<int*>(cand_vals + CLEN);
-    // flash-decoding
-    half* weight = reinterpret_cast<half*>(cand_idx + CLEN);
-    half* local_output = weight + 2 * TMA_LOAD_ONCE * HEAD_DIM;
-    float* reduction = reinterpret_cast<float*>(local_output + HEAD_DIM);
-
-    __shared__ float cluster_local_sum, cluster_local_max;
-    // store selected kv indices in shared memory in fused kernel
-    __shared__ int kv_indices[TOPK_PER_CLUSTER];
-
-    block.sync();
 
     // Init registers
-    float local_sum = 0.0, local_max = -CUDART_INF_F, pre_max = -CUDART_INF_F, scale = 0.0, softmax_scale = __frsqrt_rn(HEAD_DIM) * 1.44269504088896340736f;
     half __align__(16) reg_input[NUM_PER_THREAD], reg_weight[NUM_PER_THREAD];
-    float reg_reduce[NUM_PER_THREAD];
-    float* dst_shmem;
     float __align__(16) qk[GEMV_DEC_TILE];
 
-    // Precompute some indices
-    const uint32_t input_idx = (lane_id % 16) * 8;                // head_dim
     // indices for centers
     const uint32_t weight_idx_0 = warp_id * 4 + lane_id / 16 * 2; // seq_len. tile_size = 16
     // indices for CLEN q@k^T
     const uint32_t weight_idx_1 = warp_id * GEMV_NUM_ROW_PER_WARP + lane_id / 16 * GEMV_DEC_TILE; // seq_len. tile_size = TILE_SIZE
-    // indices for flash-decoding
-    const uint32_t weight_idx_2 = warp_id * NUM_ROW_PER_WARP_2 + (lane_id / NUM_THREAD_PER_ROW_2) * DEC_TILE;
-    const uint32_t cluster_head_idx = head_id * HEAD_DIM;
 
     // for cub::BlockRadixSort
     constexpr int CAND_ITEMS_PER_THREAD = CLEN / BLOCK_SIZE;
@@ -1092,7 +1093,6 @@ __global__ void __cluster_dims__(CLUSTER_SIZE, 1, 1) topk_attn_block_specializat
     
     // Load q into reg_input
     *(uint4*)(&reg_input[0]) = *(uint4*)(&q[cluster_head_idx + input_idx]);
-    // ---------------- STAGE 1: gemv topk ----------------
 
     // Phase 1: 使用传入的聚类中心，直接计算每个中心分数  score_c = dot(q, center[h,c,:])
     for (int i = 0; i < 2; i++) {
@@ -1166,35 +1166,56 @@ __global__ void __cluster_dims__(CLUSTER_SIZE, 1, 1) topk_attn_block_specializat
     __syncthreads();
 
     // Phase 2: this block handles its assigned top-r cluster index
-    int c = center_idx[cluster_block_id];
     // 计算所有 token 的分数：每个线程计算若干 t 并写入共享内存
     
-    // preload k
-    int common_offset = (c * CLEN + weight_idx_1) * HEAD_NUM * HEAD_DIM + cluster_head_idx + input_idx;
-    for (int i = 0; i < GEMV_DEC_TILE; i++) {
-        cp_async_pred_load_128b(
-            &k_buffer[(weight_idx_1 + i) * HEAD_DIM + input_idx],
-            &k_cache[common_offset + i * HEAD_NUM * HEAD_DIM],
-            true
-        );
-    }
-    cp_async_commit_group();
-    // main loop
-    for (int id = 1; id < CLEN / GEMV_TILE_SIZE; id++) {
-        // fill current buffer
+    for (int j = 0; j < TOPC; j++) {
+        // iterate over selected centers
+        int c = center_idx[j];
+        // preload k
+        int common_offset = (c * CLEN + weight_idx_1) * HEAD_NUM * HEAD_DIM + cluster_head_idx + input_idx;
         for (int i = 0; i < GEMV_DEC_TILE; i++) {
             cp_async_pred_load_128b(
-                &k_buffer[((id % 2) * GEMV_TILE_SIZE + weight_idx_1 + i) * HEAD_DIM + input_idx],
-                &k_cache[common_offset + (id * GEMV_TILE_SIZE + i) * HEAD_NUM * HEAD_DIM],
+                &k_buffer[(weight_idx_1 + i) * HEAD_DIM + input_idx],
+                &k_cache[common_offset + i * HEAD_NUM * HEAD_DIM],
                 true
             );
         }
         cp_async_commit_group();
+        // main loop
+        for (int id = 1; id < CLEN / GEMV_TILE_SIZE; id++) {
+            // fill current buffer
+            for (int i = 0; i < GEMV_DEC_TILE; i++) {
+                cp_async_pred_load_128b(
+                    &k_buffer[((id % 2) * GEMV_TILE_SIZE + weight_idx_1 + i) * HEAD_DIM + input_idx],
+                    &k_cache[common_offset + (id * GEMV_TILE_SIZE + i) * HEAD_NUM * HEAD_DIM],
+                    true
+                );
+            }
+            cp_async_commit_group();
 
-        // wait for last buffer
-        cp_async_wait_group<1>();
+            // wait for last buffer
+            cp_async_wait_group<1>();
+            __syncthreads();
+            // consume last buffer
+            for (int i = 0; i < GEMV_DEC_TILE; i++) {
+                *(uint4*)(&reg_weight[0]) = *(uint4*)(&k_buffer[(((id - 1) % 2) * GEMV_TILE_SIZE + weight_idx_1 + i) * HEAD_DIM + input_idx]);
+                qk[i] = 0.0f;
+                #pragma unroll
+                for (int d = 0; d < 8; d++) {
+                    qk[i] += __half2float(reg_input[d]) * __half2float(reg_weight[d]);
+                }
+                #pragma unroll
+                for (int mask = (16 >> 1); mask > 0; mask >>=1) {
+                    qk[i] += __shfl_xor_sync(0xffffffff, qk[i], mask);
+                }
+                cand_vals[(id - 1) * GEMV_TILE_SIZE + weight_idx_1 + i] = qk[i];
+                cand_idx[(id - 1) * GEMV_TILE_SIZE + weight_idx_1 + i] = (id - 1) * GEMV_TILE_SIZE + weight_idx_1 + i;
+            }
+        }
+        // epilogue
+        int id = CLEN / GEMV_TILE_SIZE;
+        cp_async_wait_group<0>();
         __syncthreads();
-        // consume last buffer
         for (int i = 0; i < GEMV_DEC_TILE; i++) {
             *(uint4*)(&reg_weight[0]) = *(uint4*)(&k_buffer[(((id - 1) % 2) * GEMV_TILE_SIZE + weight_idx_1 + i) * HEAD_DIM + input_idx]);
             qk[i] = 0.0f;
@@ -1209,56 +1230,59 @@ __global__ void __cluster_dims__(CLUSTER_SIZE, 1, 1) topk_attn_block_specializat
             cand_vals[(id - 1) * GEMV_TILE_SIZE + weight_idx_1 + i] = qk[i];
             cand_idx[(id - 1) * GEMV_TILE_SIZE + weight_idx_1 + i] = (id - 1) * GEMV_TILE_SIZE + weight_idx_1 + i;
         }
-    }
-    // epilogue
-    int id = CLEN / GEMV_TILE_SIZE;
-    cp_async_wait_group<0>();
-    __syncthreads();
-    for (int i = 0; i < GEMV_DEC_TILE; i++) {
-        *(uint4*)(&reg_weight[0]) = *(uint4*)(&k_buffer[(((id - 1) % 2) * GEMV_TILE_SIZE + weight_idx_1 + i) * HEAD_DIM + input_idx]);
-        qk[i] = 0.0f;
-        #pragma unroll
-        for (int d = 0; d < 8; d++) {
-            qk[i] += __half2float(reg_input[d]) * __half2float(reg_weight[d]);
+        block.sync();
+
+        // Radix sort CLEN elems
+        float cand_scores_local[CAND_ITEMS_PER_THREAD];
+        int cand_index_local[CAND_ITEMS_PER_THREAD];
+    #pragma unroll
+        for (int item = 0; item < CAND_ITEMS_PER_THREAD; ++item) {
+            int idx = tid * CAND_ITEMS_PER_THREAD + item;
+            cand_scores_local[item] = cand_vals[idx];
+            cand_index_local[item] = cand_idx[idx];
         }
-        #pragma unroll
-        for (int mask = (16 >> 1); mask > 0; mask >>=1) {
-            qk[i] += __shfl_xor_sync(0xffffffff, qk[i], mask);
+        CandidateRadixSort(candidate_sort_storage).SortDescending(cand_scores_local, cand_index_local);
+        block.sync();
+
+    #pragma unroll
+        for (int item = 0; item < CAND_ITEMS_PER_THREAD; ++item) {
+            int idx = tid * CAND_ITEMS_PER_THREAD + item;
+            cand_vals[idx] = cand_scores_local[item];
+            cand_idx[idx] = cand_index_local[item];
         }
-        cand_vals[(id - 1) * GEMV_TILE_SIZE + weight_idx_1 + i] = qk[i];
-        cand_idx[(id - 1) * GEMV_TILE_SIZE + weight_idx_1 + i] = (id - 1) * GEMV_TILE_SIZE + weight_idx_1 + i;
-    }
-    __syncthreads();
+        block.sync();
 
-    // Radix sort CLEN elems
-    float cand_scores_local[CAND_ITEMS_PER_THREAD];
-    int cand_index_local[CAND_ITEMS_PER_THREAD];
-#pragma unroll
-    for (int item = 0; item < CAND_ITEMS_PER_THREAD; ++item) {
-        int idx = tid * CAND_ITEMS_PER_THREAD + item;
-        cand_scores_local[item] = cand_vals[idx];
-        cand_index_local[item] = cand_idx[idx];
+        // 写回 top-512 的全局索引 (to shared memory buffer)
+        for (int i = tid; i < TOPK_PER_CLUSTER; i += blockDim.x) {
+            int local = cand_idx[i];
+            int global_idx = c * CLEN + local;
+            kv_indices[j * TOPK_PER_CLUSTER + i] = global_idx;
+        }
+        block.sync();
     }
-    CandidateRadixSort(candidate_sort_storage).SortDescending(cand_scores_local, cand_index_local);
-    __syncthreads();
-
-#pragma unroll
-    for (int item = 0; item < CAND_ITEMS_PER_THREAD; ++item) {
-        int idx = tid * CAND_ITEMS_PER_THREAD + item;
-        cand_vals[idx] = cand_scores_local[item];
-        cand_idx[idx] = cand_index_local[item];
+// end gemv_topk block
+    } else {
+// begin flash-decoding blocks
+    for (int i = tid; i < TOPC * TOPK_PER_CLUSTER; i += blockDim.x) {
+        kv_indices[i] = 0;
     }
-    __syncthreads();
+    block.sync();
+    // Init shared memory
+    half* weight = reinterpret_cast<half*>((uintptr_t)(shmem_base) + 127 & ~127);
+    half* local_output = weight + 2 * TMA_LOAD_ONCE * HEAD_DIM;
+    float* reduction = reinterpret_cast<float*>(local_output + HEAD_DIM);
+    __shared__ float cluster_local_sum, cluster_local_max;
 
-    // 写回 top-512 的全局索引(to shared memory buffer)
-    for (int i = tid; i < TOPK_PER_CLUSTER; i += blockDim.x) {
-        int local = cand_idx[i];
-        int global_idx = c * CLEN + local;
-        kv_indices[i] = global_idx;
-    }
-    __syncthreads();
+    // Init registers
+    float local_sum = 0.0, local_max = -CUDART_INF_F, pre_max = -CUDART_INF_F, scale = 0.0, softmax_scale = __frsqrt_rn(HEAD_DIM) * 1.44269504088896340736f;
+    half __align__(16) reg_input[NUM_PER_THREAD], reg_weight[NUM_PER_THREAD];
+    float reg_reduce[NUM_PER_THREAD];
+    float* dst_shmem;
+    float __align__(16) qk[DEC_TILE];
 
-    // ---------------- STAGE 2: flash decoding ----------------
+    // indices for flash-decoding
+    const uint32_t weight_idx_2 = warp_id * NUM_ROW_PER_WARP_2 + (lane_id / NUM_THREAD_PER_ROW_2) * DEC_TILE;
+
     // Compute flash-decoding
     local_sum = 0.0f;
     for(int i = 0; i < NUM_PER_THREAD; i++)
@@ -1433,9 +1457,9 @@ __global__ void __cluster_dims__(CLUSTER_SIZE, 1, 1) topk_attn_block_specializat
     }
     cluster.sync();
     // ClusterReduce: local_max
-    for (int i = 1; i < cluster.num_blocks(); i++) {
+    for (int i = 1; i < cluster.num_blocks() - 1; i++) {
         if (tid == 0) {
-            int dst_cta = (cluster_block_id + i) % cluster.num_blocks();
+            int dst_cta = (cluster_block_id + i) % (cluster.num_blocks() - 1);
             dst_shmem = cluster.map_shared_rank(&cluster_local_max, dst_cta);  
         }
         cluster.sync();
@@ -1456,9 +1480,9 @@ __global__ void __cluster_dims__(CLUSTER_SIZE, 1, 1) topk_attn_block_specializat
     }
     cluster.sync();
     // ClusterReduce: local_sum
-    for (int i = 1; i < cluster.num_blocks(); i++) {
+    for (int i = 1; i < (cluster.num_blocks() - 1); i++) {
         if (tid == 0) {
-            int dst_cta = (cluster_block_id + i) % cluster.num_blocks();
+            int dst_cta = (cluster_block_id + i) % (cluster.num_blocks() - 1);
             dst_shmem = cluster.map_shared_rank(&cluster_local_sum, dst_cta);  
         }
         cluster.sync();
@@ -1480,6 +1504,8 @@ __global__ void __cluster_dims__(CLUSTER_SIZE, 1, 1) topk_attn_block_specializat
     block.sync();
 
     atomicAdd(&output[head_id * HEAD_DIM + tid], local_output[tid]);
+// end flash-decoding block
+    }
 }
 
 // ---------------- Main: generate indices then decode ----------------
@@ -1593,7 +1619,9 @@ int main(int argc, char** argv) {
 
     // ---- Baseline 3 ----
     dim3 grid_bs(HEAD_NUM * CLUSTER_SIZE), block_bs(BLOCK_SIZE);
-    uint32_t bs_shmem_bytes = GEMV_SHARED_BYTES + (2 * TMA_LOAD_ONCE * HEAD_DIM + HEAD_DIM) * sizeof(half) + 2 * DIM_BLOCK_REDUCE * sizeof(float);
+    uint32_t bs_shmem_bytes = std::max<uint32_t>(
+        GEMV_SHARED_BYTES,
+        (2 * TMA_LOAD_ONCE * HEAD_DIM + HEAD_DIM) * sizeof(half) + 2 * DIM_BLOCK_REDUCE * sizeof(float));
     CUDA_TRY(cudaFuncSetAttribute(topk_attn_block_specialization_kernel, cudaFuncAttributeNonPortableClusterSizeAllowed, 1));
     CUDA_TRY(cudaFuncSetAttribute(topk_attn_block_specialization_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(bs_shmem_bytes)));
     printf("---- Baseline 3 (topk-attn block specialization kernel) latency test ----\n");
@@ -1610,7 +1638,7 @@ int main(int argc, char** argv) {
         topk_attn_block_specialization_kernel<<<grid_fused, block_fused, bs_shmem_bytes>>>(d_out_3, d_k, d_v, d_q, d_centers);
     }
     cudaEventRecord(ed_bs); cudaEventSynchronize(ed_bs); cudaEventElapsedTime(&ms_bs, st_bs, ed_bs);
-    printf("baseline 2 latency: %.3f us\n", (ms_bs / iters_bs) * 1000.0f);
+    printf("baseline 3 latency: %.3f us\n", (ms_bs / iters_bs) * 1000.0f);
 
     // ---- Correctness check ----
     // run baseline 1
