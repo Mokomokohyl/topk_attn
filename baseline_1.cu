@@ -373,7 +373,7 @@ __global__ void __cluster_dims__(CLUSTER_SIZE, 1, 1) MHAFlashDecodeKernel(
     for (int j = 0; j < DEC_TILE; j++) {
         cp_async_pred_load_128b(
             &weight[0 + (weight_idx_2 + j) * HEAD_DIM + input_idx_2], 
-            &k_cache[(kv_indices[head_id * SEQ_LEN + KV_DIM_PER_BLOCK * cluster_block_id + j]) * HEAD_NUM * HEAD_DIM + cluster_head_idx + input_idx_2],
+            &k_cache[(kv_indices[head_id * SEQ_LEN + KV_DIM_PER_BLOCK * cluster_block_id + weight_idx_2 + j]) * HEAD_NUM * HEAD_DIM + cluster_head_idx + input_idx_2],
             true
         );
     }
@@ -381,7 +381,7 @@ __global__ void __cluster_dims__(CLUSTER_SIZE, 1, 1) MHAFlashDecodeKernel(
     for (int j = 0; j < DEC_TILE; j++) {
         cp_async_pred_load_128b(
             &weight[TMA_LOAD_ONCE_NUM_ATTN + (weight_idx_2 + j) * HEAD_DIM + input_idx_2], 
-            &v_cache[(kv_indices[head_id * SEQ_LEN + KV_DIM_PER_BLOCK * cluster_block_id + j]) * HEAD_NUM * HEAD_DIM + cluster_head_idx + input_idx_2],
+            &v_cache[(kv_indices[head_id * SEQ_LEN + KV_DIM_PER_BLOCK * cluster_block_id + weight_idx_2 + j]) * HEAD_NUM * HEAD_DIM + cluster_head_idx + input_idx_2],
             true
         );
     }
@@ -392,7 +392,7 @@ __global__ void __cluster_dims__(CLUSTER_SIZE, 1, 1) MHAFlashDecodeKernel(
         for (int j = 0; j < DEC_TILE; j++) {
             cp_async_pred_load_128b(
                 &weight[(id % 2) * TMA_LOAD_ONCE_NUM + (weight_idx_2 + j) * HEAD_DIM + input_idx_2], 
-                &k_cache[(kv_indices[head_id * SEQ_LEN + KV_DIM_PER_BLOCK * cluster_block_id + j]) * HEAD_NUM * HEAD_DIM + cluster_head_idx + input_idx_2],
+                &k_cache[(kv_indices[head_id * SEQ_LEN + KV_DIM_PER_BLOCK * cluster_block_id + id * TMA_LOAD_ONCE_ATTN + weight_idx_2 + j]) * HEAD_NUM * HEAD_DIM + cluster_head_idx + input_idx_2],
                 true
             );
         }
@@ -435,7 +435,7 @@ __global__ void __cluster_dims__(CLUSTER_SIZE, 1, 1) MHAFlashDecodeKernel(
         for (int j = 0; j < DEC_TILE; j++) {
             cp_async_pred_load_128b(
                 &weight[(id % 2) * TMA_LOAD_ONCE_NUM + TMA_LOAD_ONCE_NUM_ATTN + (weight_idx_2 + j) * HEAD_DIM + input_idx_2], 
-                &v_cache[(kv_indices[head_id * SEQ_LEN + KV_DIM_PER_BLOCK * cluster_block_id + j]) * HEAD_NUM * HEAD_DIM + cluster_head_idx + input_idx_2],
+                &v_cache[(kv_indices[head_id * SEQ_LEN + KV_DIM_PER_BLOCK * cluster_block_id + id * TMA_LOAD_ONCE_ATTN + weight_idx_2 + j]) * HEAD_NUM * HEAD_DIM + cluster_head_idx + input_idx_2],
                 true
             );
         }
