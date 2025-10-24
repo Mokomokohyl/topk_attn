@@ -14,6 +14,7 @@
 #include "cuda_fp16.h"
 #include <string.h>
 #include <numeric>
+#include <cub/block/block_radix_sort.cuh>
 
 // Problem constants (match gemv_topk.cu)
 #define HD 128
@@ -30,6 +31,7 @@
 #define GEMV_WEIGHT_BUFFER_LEN (GEMV_TILE_SIZE * 2)
 #define GEMV_NUM_ROW_PER_WARP (GEMV_TILE_SIZE / 4)
 #define GEMV_DEC_TILE (GEMV_NUM_ROW_PER_WARP / 2)
+static constexpr int CENTER_SORT_CAP = 32;
 
 __device__ __forceinline__ void cp_async_pred_load_128b(half* smem_ptr, const half* gmem_ptr, bool predicate) {
     uint32_t smem_int_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
@@ -76,6 +78,18 @@ __global__ void gemv_phase_kernel(const __half* __restrict__ kv,
     __shared__ float cand_vals[CLEN];
     __shared__ int cand_idx[CLEN];
     __shared__ half k_buffer[GEMV_WEIGHT_BUFFER_LEN * HD];
+
+    constexpr int BLOCK_THREADS = 128;
+    constexpr int CAND_ITEMS_PER_THREAD = CLEN / BLOCK_THREADS;
+    static_assert(CLEN % BLOCK_THREADS == 0, "CLEN must be divisible by BLOCK_THREADS");
+    using CenterRadixSort = cub::BlockRadixSort<float, BLOCK_THREADS, 1, int>;
+    using CandidateRadixSort = cub::BlockRadixSort<float, BLOCK_THREADS, CAND_ITEMS_PER_THREAD, int>;
+    __shared__ typename CenterRadixSort::TempStorage center_sort_storage;
+    __shared__ typename CandidateRadixSort::TempStorage candidate_sort_storage;
+
+    if (blockDim.x != BLOCK_THREADS) {
+        return;
+    }
 
     half __align__(16) reg_input[8], reg_weight[8];
     float __align__(16) qk[2];
@@ -139,25 +153,25 @@ __global__ void gemv_phase_kernel(const __half* __restrict__ kv,
     }
     __syncthreads();
 
-    // Bitonic sort 32 centers (same as gemv_topk)
-    for (int kseq = 2; kseq <= 32; kseq <<= 1) {
-        for (int j = kseq >> 1; j > 0; j >>= 1) {
-            int i = tid;
-            if (i < 32) {
-                int ixj = i ^ j;
-                if (ixj > i) {
-                    bool up = ((i & kseq) != 0);
-                    float vi = center_vals[i];
-                    float vx = center_vals[ixj];
-                    if ((vi > vx) == up) {
-                        center_vals[i] = vx; center_vals[ixj] = vi;
-                        int ti = center_idx[i]; center_idx[i] = center_idx[ixj]; center_idx[ixj] = ti;
-                    }
-                }
-            }
-            __syncthreads();
-        }
+    if (tid < CENTER_SORT_CAP && tid >= CSZ) {
+        center_vals[tid] = -INFINITY;
+        center_idx[tid] = -1;
     }
+    __syncthreads();
+
+    // Radix sort
+    float center_score_arr[1];
+    int center_id_arr[1];
+    center_score_arr[0] = (tid < CENTER_SORT_CAP) ? center_vals[tid] : -INFINITY;
+    center_id_arr[0] = (tid < CENTER_SORT_CAP) ? center_idx[tid] : -1;
+    CenterRadixSort(center_sort_storage).SortDescending(center_score_arr, center_id_arr);
+    __syncthreads();
+
+    if (tid < CENTER_SORT_CAP) {
+        center_vals[tid] = center_score_arr[0];
+        center_idx[tid] = center_id_arr[0];
+    }
+    __syncthreads();
 
     int c = center_idx[r_assigned];
 
@@ -241,6 +255,18 @@ __global__ void bitonic_phase_kernel(const float* __restrict__ cand_vals_in,
     __shared__ float cand_vals[CLEN];
     __shared__ int cand_idx[CLEN];
 
+    constexpr int BLOCK_THREADS = 128;
+    constexpr int CAND_ITEMS_PER_THREAD = CLEN / BLOCK_THREADS;
+    static_assert(CLEN % BLOCK_THREADS == 0, "CLEN must be divisible by BLOCK_THREADS");
+    using CenterRadixSort = cub::BlockRadixSort<float, BLOCK_THREADS, 1, int>;
+    using CandidateRadixSort = cub::BlockRadixSort<float, BLOCK_THREADS, CAND_ITEMS_PER_THREAD, int>;
+    __shared__ typename CenterRadixSort::TempStorage center_sort_storage;
+    __shared__ typename CandidateRadixSort::TempStorage candidate_sort_storage;
+
+    if (blockDim.x != BLOCK_THREADS) {
+        return;
+    }
+
     // commented initialization steps
     // for (int i = tid; i < CLEN; i += blockDim.x) {
         // unsigned int seed = (unsigned int)(g * 0x45d9f3bu) ^ (unsigned int)(i * 0x27d4eb2du);
@@ -251,23 +277,24 @@ __global__ void bitonic_phase_kernel(const float* __restrict__ cand_vals_in,
     // }
     // __syncthreads();
 
-    for (int kseq = 2; kseq <= CLEN; kseq <<= 1) {
-        for (int j = kseq >> 1; j > 0; j >>= 1) {
-            for (int i = tid; i < CLEN; i += blockDim.x) {
-                int ixj = i ^ j;
-                if (ixj > i) {
-                    bool up = ((i & kseq) != 0);
-                    float vi = cand_vals[i];
-                    float vx = cand_vals[ixj];
-                    if ((vi > vx) == up) {
-                        cand_vals[i] = vx; cand_vals[ixj] = vi;
-                        int ti = cand_idx[i]; cand_idx[i] = cand_idx[ixj]; cand_idx[ixj] = ti;
-                    }
-                }
-            }
-            __syncthreads();
-        }
+    float cand_scores_local[CAND_ITEMS_PER_THREAD];
+    int cand_index_local[CAND_ITEMS_PER_THREAD];
+#pragma unroll
+    for (int item = 0; item < CAND_ITEMS_PER_THREAD; ++item) {
+        int idx = tid * CAND_ITEMS_PER_THREAD + item;
+        cand_scores_local[item] = cand_vals[idx];
+        cand_index_local[item] = cand_idx[idx];
     }
+    CandidateRadixSort(candidate_sort_storage).SortDescending(cand_scores_local, cand_index_local);
+    __syncthreads();
+
+#pragma unroll
+    for (int item = 0; item < CAND_ITEMS_PER_THREAD; ++item) {
+        int idx = tid * CAND_ITEMS_PER_THREAD + item;
+        cand_vals[idx] = cand_scores_local[item];
+        cand_idx[idx] = cand_index_local[item];
+    }
+    __syncthreads();
 
     int c = chosen_centers[g];
     for (int i = tid; i < TOPK_PER_CLUSTER; i += blockDim.x) {
