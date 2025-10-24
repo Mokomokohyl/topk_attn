@@ -25,8 +25,11 @@
 #define TOPK_PER_CLUSTER 512
 #define OUT_PER_HEAD (TOPC * TOPK_PER_CLUSTER)
 
-#define WEIGHT_BUFFER_LEN 32
-#define STAGE_OFFSET (WEIGHT_BUFFER_LEN / 2)
+// for GeMV
+#define GEMV_TILE_SIZE 32
+#define GEMV_WEIGHT_BUFFER_LEN (GEMV_TILE_SIZE * 2)
+#define GEMV_NUM_ROW_PER_WARP (GEMV_TILE_SIZE / 4)
+#define GEMV_DEC_TILE (GEMV_NUM_ROW_PER_WARP / 2)
 
 __device__ __forceinline__ void cp_async_pred_load_128b(half* smem_ptr, const half* gmem_ptr, bool predicate) {
     uint32_t smem_int_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
@@ -72,7 +75,7 @@ __global__ void gemv_phase_kernel(const __half* __restrict__ kv,
     __shared__ int center_idx[32];
     __shared__ float cand_vals[CLEN];
     __shared__ int cand_idx[CLEN];
-    __shared__ half k_buffer[WEIGHT_BUFFER_LEN * HD];
+    __shared__ half k_buffer[GEMV_WEIGHT_BUFFER_LEN * HD];
 
     half __align__(16) reg_input[8], reg_weight[8];
     float __align__(16) qk[2];
@@ -87,9 +90,9 @@ __global__ void gemv_phase_kernel(const __half* __restrict__ kv,
     }
     cp_async_commit_group();
     for (int i = 0; i < 2; ++i) {
-        cp_async_pred_load_128b(&k_buffer[(STAGE_OFFSET + weight_idx + i) * HD + input_idx],
-                                &centers[h * CSZ * HD + (STAGE_OFFSET + weight_idx + i) * HD + input_idx],
-                                (STAGE_OFFSET + weight_idx + i < CSZ));
+        cp_async_pred_load_128b(&k_buffer[(GEMV_TILE_SIZE + weight_idx + i) * HD + input_idx],
+                                &centers[h * CSZ * HD + (GEMV_TILE_SIZE + weight_idx + i) * HD + input_idx],
+                                (GEMV_TILE_SIZE + weight_idx + i < CSZ));
     }
     cp_async_commit_group();
     cp_async_wait_group<1>();
@@ -113,7 +116,7 @@ __global__ void gemv_phase_kernel(const __half* __restrict__ kv,
     __syncthreads();
 
     for (int i = 0; i < 2; ++i) {
-        *(uint4*)(&reg_weight[0]) = *(uint4*)(&k_buffer[(STAGE_OFFSET + weight_idx + i) * HD + input_idx]);
+        *(uint4*)(&reg_weight[0]) = *(uint4*)(&k_buffer[(GEMV_TILE_SIZE + weight_idx + i) * HD + input_idx]);
         qk[i] = 0.f;
         #pragma unroll
         for (int d = 0; d < 8; ++d) {
@@ -123,8 +126,8 @@ __global__ void gemv_phase_kernel(const __half* __restrict__ kv,
         for (int mask = 16 >> 1; mask > 0; mask >>= 1) {
             qk[i] += __shfl_xor_sync(0xffffffff, qk[i], mask);
         }
-        center_vals[STAGE_OFFSET + weight_idx + i] = qk[i];
-        center_idx[STAGE_OFFSET + weight_idx + i] = STAGE_OFFSET + weight_idx + i;
+        center_vals[GEMV_TILE_SIZE + weight_idx + i] = qk[i];
+        center_idx[GEMV_TILE_SIZE + weight_idx + i] = GEMV_TILE_SIZE + weight_idx + i;
     }
     __syncthreads();
 
@@ -157,68 +160,69 @@ __global__ void gemv_phase_kernel(const __half* __restrict__ kv,
     }
 
     int c = center_idx[r_assigned];
-    if (tid == 0) {
-        chosen_centers[g] = c;
-    }
-    __syncthreads();
 
-    // Preload kv
+    // preload k
     int common_offset = (c * CLEN + weight_idx) * HN * HD + h * HD + input_idx;
-    for (int i = 0; i < 2; ++i) {
-        cp_async_pred_load_128b(&k_buffer[(weight_idx + i) * HD + input_idx],
-                                &kv[common_offset + i * HN * HD], true);
+    for (int i = 0; i < GEMV_DEC_TILE; i++) {
+        cp_async_pred_load_128b(
+            &k_buffer[(weight_idx + i) * HD + input_idx],
+            &kv[common_offset + i * HN * HD],
+            true
+        );
     }
     cp_async_commit_group();
-
-    for (int id = 1; id < CLEN / 16; ++id) {
-        for (int i = 0; i < 2; ++i) {
-            cp_async_pred_load_128b(&k_buffer[((id % 2) * STAGE_OFFSET + weight_idx + i) * HD + input_idx],
-                                    &kv[common_offset + (id * 16 + i) * HN * HD], true);
+    // main loop
+    for (int id = 1; id < CLEN / GEMV_TILE_SIZE; id++) {
+        // fill current buffer
+        for (int i = 0; i < GEMV_DEC_TILE; i++) {
+            cp_async_pred_load_128b(
+                &k_buffer[((id % 2) * GEMV_TILE_SIZE + weight_idx + i) * HD + input_idx],
+                &kv[common_offset + (id * GEMV_TILE_SIZE + i) * HN * HD],
+                true
+            );
         }
         cp_async_commit_group();
 
+        // wait for last buffer
         cp_async_wait_group<1>();
         __syncthreads();
-        for (int i = 0; i < 2; ++i) {
-            *(uint4*)(&reg_weight[0]) = *(uint4*)(&k_buffer[(((id - 1) % 2) * STAGE_OFFSET + weight_idx + i) * HD + input_idx]);
-            qk[i] = 0.f;
+        // consume last buffer
+        for (int i = 0; i < GEMV_DEC_TILE; i++) {
+            *(uint4*)(&reg_weight[0]) = *(uint4*)(&k_buffer[(((id - 1) % 2) * GEMV_TILE_SIZE + weight_idx + i) * HD + input_idx]);
+            qk[i] = 0.0f;
             #pragma unroll
-            for (int d = 0; d < 8; ++d) {
+            for (int d = 0; d < 8; d++) {
                 qk[i] += __half2float(reg_input[d]) * __half2float(reg_weight[d]);
             }
             #pragma unroll
-            for (int mask = 16 >> 1; mask > 0; mask >>= 1) {
+            for (int mask = (16 >> 1); mask > 0; mask >>=1) {
                 qk[i] += __shfl_xor_sync(0xffffffff, qk[i], mask);
             }
-            cand_vals[(id - 1) * 16 + weight_idx + i] = qk[i];
-            cand_idx[(id - 1) * 16 + weight_idx + i] = (id - 1) * 16 + weight_idx + i;
+            cand_vals[(id - 1) * GEMV_TILE_SIZE + weight_idx + i] = qk[i];
+            cand_idx[(id - 1) * GEMV_TILE_SIZE + weight_idx + i] = (id - 1) * GEMV_TILE_SIZE + weight_idx + i;
         }
     }
-
-    int id = CLEN / 16;
+    // epilogue
+    int id = CLEN / GEMV_TILE_SIZE;
     cp_async_wait_group<0>();
     __syncthreads();
-    for (int i = 0; i < 2; ++i) {
-        *(uint4*)(&reg_weight[0]) = *(uint4*)(&k_buffer[(((id - 1) % 2) * STAGE_OFFSET + weight_idx + i) * HD + input_idx]);
-        qk[i] = 0.f;
+    for (int i = 0; i < GEMV_DEC_TILE; i++) {
+        *(uint4*)(&reg_weight[0]) = *(uint4*)(&k_buffer[(((id - 1) % 2) * GEMV_TILE_SIZE + weight_idx + i) * HD + input_idx]);
+        qk[i] = 0.0f;
         #pragma unroll
-        for (int d = 0; d < 8; ++d) {
+        for (int d = 0; d < 8; d++) {
             qk[i] += __half2float(reg_input[d]) * __half2float(reg_weight[d]);
         }
         #pragma unroll
-        for (int mask = 16 >> 1; mask > 0; mask >>= 1) {
+        for (int mask = (16 >> 1); mask > 0; mask >>=1) {
             qk[i] += __shfl_xor_sync(0xffffffff, qk[i], mask);
         }
-        cand_vals[(id - 1) * 16 + weight_idx + i] = qk[i];
-        cand_idx[(id - 1) * 16 + weight_idx + i] = (id - 1) * 16 + weight_idx + i;
+        cand_vals[(id - 1) * GEMV_TILE_SIZE + weight_idx + i] = qk[i];
+        cand_idx[(id - 1) * GEMV_TILE_SIZE + weight_idx + i] = (id - 1) * GEMV_TILE_SIZE + weight_idx + i;
     }
     __syncthreads();
 
-    int base = g * CLEN;
-    for (int t = tid; t < CLEN; t += blockDim.x) {
-        cand_vals_out[base + t] = cand_vals[t];
-        cand_idx_out[base + t] = cand_idx[t];
-    }
+    // skip write to global.
 }
 
 // ---------------- Bitonic phase kernel ----------------
