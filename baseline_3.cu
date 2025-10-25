@@ -1065,6 +1065,7 @@ __global__ void __cluster_dims__(CLUSTER_SIZE, 1, 1) topk_attn_block_specializat
     // store selected kv indices in shared memory
     __shared__ __align__(16) int kv_indices[TOPC * TOPK_PER_CLUSTER];
     __shared__ __align__(16) int lock;
+    volatile int* lock_ptr = &lock;
     int *dst_shmem;
     lock = 0;
 
@@ -1283,10 +1284,13 @@ __global__ void __cluster_dims__(CLUSTER_SIZE, 1, 1) topk_attn_block_specializat
 // begin flash-decoding blocks
 
     // wait for lock to release
-    while (lock == 0) {
-        __nanosleep(64);
+    while (*lock_ptr == 0) {
+        __nanosleep(32);
     };
-    // Print or not will affect final output.
+    // Print or not will affect final output. NOTE: fixed after dereference lock with lock_ptr defined as below
+    // volatile int* lock_ptr = &lock;
+
+    // Debug print
     // if (head_id == 0 && cluster_block_id == 0 && tid == 0) {
         // printf("baseline 3 head0 cluster_block_id=0 kv_indices[0..15]: ");
         // for (int i = 0; i < 16; ++i) {
@@ -1668,7 +1672,7 @@ int main(int argc, char** argv) {
     CUDA_TRY(cudaFuncSetAttribute(topk_attn_block_specialization_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(bs_shmem_bytes)));
     printf("---- Baseline 3 (topk-attn block specialization kernel) latency test ----\n");
     // Commented for debugging.
-    // int warmup_bs = 5, iters_bs = 50; float ms_bs = 0.f;
+    int warmup_bs = 5, iters_bs = 50; float ms_bs = 0.f;
     // CUDA_CHECK(cudaMemset(d_out_3, 0, sizeof(half) * (size_t)HEAD_NUM * HEAD_DIM));
     // topk_attn_block_specialization_kernel<<<grid_fused, block_fused, bs_shmem_bytes>>>(d_out_3, d_k, d_v, d_q, d_centers);
     // CUDA_CHECK(cudaDeviceSynchronize());
