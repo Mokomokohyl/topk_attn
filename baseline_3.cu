@@ -872,10 +872,8 @@ __global__ void __cluster_dims__(CLUSTER_SIZE, 1, 1) topk_attn_fused_kernel(
         // For filled zeros
         #pragma unroll
         for (int j = 0; j < DEC_TILE; j++) {
-            if ((KV_DIM_PER_BLOCK * cluster_block_id + (id - 1) * TMA_LOAD_ONCE_ATTN + weight_idx_2 + j) < SEQ_LEN) {
-                qk[j] = ptx_exp2(qk[j] - local_max);
-                local_sum += qk[j];
-            }
+            qk[j] = ptx_exp2(qk[j] - local_max);
+            local_sum += qk[j];
         }
         #pragma unroll
         for (int j = 0; j < NUM_PER_THREAD; j++) {
@@ -928,10 +926,8 @@ __global__ void __cluster_dims__(CLUSTER_SIZE, 1, 1) topk_attn_fused_kernel(
     local_sum *= scale;
     #pragma unroll
     for (int j = 0; j < DEC_TILE; j++) {
-        if ((KV_DIM_PER_BLOCK * cluster_block_id + (KV_DIM_PER_BLOCK / TMA_LOAD_ONCE_ATTN - 1) * TMA_LOAD_ONCE_ATTN + weight_idx_2 + j) < SEQ_LEN) {
-            qk[j] = ptx_exp2(qk[j] - local_max);
-            local_sum += qk[j];
-        }
+        qk[j] = ptx_exp2(qk[j] - local_max);
+        local_sum += qk[j];
     }
     #pragma unroll
     for (int j = 0; j < NUM_PER_THREAD; j++) {
@@ -1070,6 +1066,7 @@ __global__ void __cluster_dims__(CLUSTER_SIZE, 1, 1) topk_attn_block_specializat
     lock = 0;
 
     extern __shared__ uint8_t shmem_base[];
+
     if (cluster_block_id == CLUSTER_SIZE - 1) {
 // begin gemv_topk block 
     // Init shared memory
@@ -1372,13 +1369,10 @@ __global__ void __cluster_dims__(CLUSTER_SIZE, 1, 1) topk_attn_block_specializat
         }
         scale = ptx_exp2(pre_max - local_max);
         local_sum *= scale;
-        // For filled zeros
         #pragma unroll
         for (int j = 0; j < DEC_TILE; j++) {
-            if ((KV_DIM_PER_BLOCK_BS * cluster_block_id + (id - 1) * TMA_LOAD_ONCE_ATTN + weight_idx_2 + j) < SEQ_LEN) {
-                qk[j] = ptx_exp2(qk[j] - local_max);
-                local_sum += qk[j];
-            }
+            qk[j] = ptx_exp2(qk[j] - local_max);
+            local_sum += qk[j];
         }
         #pragma unroll
         for (int j = 0; j < NUM_PER_THREAD; j++) {
@@ -1431,10 +1425,8 @@ __global__ void __cluster_dims__(CLUSTER_SIZE, 1, 1) topk_attn_block_specializat
     local_sum *= scale;
     #pragma unroll
     for (int j = 0; j < DEC_TILE; j++) {
-        if ((KV_DIM_PER_BLOCK_BS * cluster_block_id + (KV_DIM_PER_BLOCK_BS / TMA_LOAD_ONCE_ATTN - 1) * TMA_LOAD_ONCE_ATTN + weight_idx_2 + j) < SEQ_LEN) {
-            qk[j] = ptx_exp2(qk[j] - local_max);
-            local_sum += qk[j];
-        }
+        qk[j] = ptx_exp2(qk[j] - local_max);
+        local_sum += qk[j];
     }
     #pragma unroll
     for (int j = 0; j < NUM_PER_THREAD; j++) {
@@ -1672,7 +1664,7 @@ int main(int argc, char** argv) {
     CUDA_TRY(cudaFuncSetAttribute(topk_attn_block_specialization_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(bs_shmem_bytes)));
     printf("---- Baseline 3 (topk-attn block specialization kernel) latency test ----\n");
     // Commented for debugging.
-    int warmup_bs = 5, iters_bs = 50; float ms_bs = 0.f;
+    // int warmup_bs = 5, iters_bs = 50; float ms_bs = 0.f;
     // CUDA_CHECK(cudaMemset(d_out_3, 0, sizeof(half) * (size_t)HEAD_NUM * HEAD_DIM));
     // topk_attn_block_specialization_kernel<<<grid_fused, block_fused, bs_shmem_bytes>>>(d_out_3, d_k, d_v, d_q, d_centers);
     // CUDA_CHECK(cudaDeviceSynchronize());
