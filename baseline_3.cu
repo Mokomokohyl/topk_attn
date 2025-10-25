@@ -21,6 +21,9 @@ using barrier = cuda::barrier<cuda::thread_scope_block>;
 namespace cde = cuda::device::experimental;
 namespace cg = cooperative_groups;
 
+// DEBUG macro
+#define DEBUG
+
 #define CUDA_CHECK(call) do { \
 	cudaError_t err = (call); \
 	if (err != cudaSuccess) { \
@@ -1288,13 +1291,15 @@ __global__ void __cluster_dims__(CLUSTER_SIZE, 1, 1) topk_attn_block_specializat
     // volatile int* lock_ptr = &lock;
 
     // Debug print
-    // if (head_id == 0 && cluster_block_id == 0 && tid == 0) {
-        // printf("baseline 3 head0 cluster_block_id=0 kv_indices[0..15]: ");
-        // for (int i = 0; i < 16; ++i) {
-            // printf("%d ", kv_indices[i]);
-        // }
-        // printf("\n");
-    // }
+#ifdef DEBUG
+    if (head_id == 0 && cluster_block_id == 0 && tid == 0) {
+        printf("baseline 3 head0 cluster_block_id=0 kv_indices[0..15]: ");
+        for (int i = 0; i < 16; ++i) {
+            printf("%d ", kv_indices[i]);
+        }
+        printf("\n");
+    }
+#endif
 
     block.sync();
     // Init shared memory
@@ -1603,6 +1608,7 @@ int main(int argc, char** argv) {
 	uint32_t max_shmem_size = (2 * TMA_LOAD_ONCE * HEAD_DIM + HEAD_DIM) * sizeof(half) + 2 * DIM_BLOCK_REDUCE * sizeof(float);
 	CUDA_TRY(cudaFuncSetAttribute(MHAFlashDecodeKernel, cudaFuncAttributeNonPortableClusterSizeAllowed, 1));
 	CUDA_TRY(cudaFuncSetAttribute(MHAFlashDecodeKernel, cudaFuncAttributeMaxDynamicSharedMemorySize, max_shmem_size));
+#ifndef DEBUG
     printf("---- Baseline 1 (topk kernel + attn kernel) latency test ----\n");
     int warmup_combo = 5, iters_combo = 50; float ms_combo = 0.f;
     for (int i = 0; i < warmup_combo; ++i) {
@@ -1618,19 +1624,8 @@ int main(int argc, char** argv) {
     }
     cudaEventRecord(ed_combo); cudaEventSynchronize(ed_combo); cudaEventElapsedTime(&ms_combo, st_combo, ed_combo);
     printf("baseline 1 latency: %.3f us\n", (ms_combo / iters_combo) * 1000.0f);
+#endif
 
-    // Inspect top-k indices produced by baseline 1
-    std::vector<int> h_kv_indices(HEAD_NUM * OUT_PER_HEAD);
-    CUDA_CHECK(cudaMemcpy(
-        h_kv_indices.data(),
-        d_kv_indices,
-        sizeof(int) * static_cast<size_t>(HEAD_NUM) * OUT_PER_HEAD,
-        cudaMemcpyDeviceToHost));
-    printf("baseline 1 head0 kv_indices[0..15]: ");
-    for (int i = 0; i < 16; ++i) {
-        printf("%d ", h_kv_indices[i]);
-    }
-    printf("\n");
 
     // ---- Baseline 2 ----
     dim3 grid_fused(HEAD_NUM * CLUSTER_SIZE), block_fused(BLOCK_SIZE);
@@ -1639,6 +1634,7 @@ int main(int argc, char** argv) {
         (2 * TMA_LOAD_ONCE * HEAD_DIM + HEAD_DIM) * sizeof(half) + 2 * DIM_BLOCK_REDUCE * sizeof(float));
     CUDA_TRY(cudaFuncSetAttribute(topk_attn_fused_kernel, cudaFuncAttributeNonPortableClusterSizeAllowed, 1));
     CUDA_TRY(cudaFuncSetAttribute(topk_attn_fused_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(fused_shmem_bytes)));
+#ifndef DEBUG
     printf("---- Baseline 2 (topk-attn directly fused kernel) latency test ----\n");
     int warmup_fused = 5, iters_fused = 50; float ms_fused = 0.f;
     CUDA_CHECK(cudaMemset(d_out_2, 0, sizeof(half) * (size_t)HEAD_NUM * HEAD_DIM));
@@ -1654,6 +1650,7 @@ int main(int argc, char** argv) {
     }
     cudaEventRecord(ed_fused); cudaEventSynchronize(ed_fused); cudaEventElapsedTime(&ms_fused, st_fused, ed_fused);
     printf("baseline 2 latency: %.3f us\n", (ms_fused / iters_fused) * 1000.0f);
+#endif
 
     // ---- Baseline 3 ----
     dim3 grid_bs(HEAD_NUM * CLUSTER_SIZE), block_bs(BLOCK_SIZE);
@@ -1662,26 +1659,29 @@ int main(int argc, char** argv) {
         (2 * TMA_LOAD_ONCE * HEAD_DIM + HEAD_DIM) * sizeof(half) + 2 * DIM_BLOCK_REDUCE * sizeof(float));
     CUDA_TRY(cudaFuncSetAttribute(topk_attn_block_specialization_kernel, cudaFuncAttributeNonPortableClusterSizeAllowed, 1));
     CUDA_TRY(cudaFuncSetAttribute(topk_attn_block_specialization_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(bs_shmem_bytes)));
+#ifndef DEBUG
     printf("---- Baseline 3 (topk-attn block specialization kernel) latency test ----\n");
     // Commented for debugging.
-    // int warmup_bs = 5, iters_bs = 50; float ms_bs = 0.f;
-    // CUDA_CHECK(cudaMemset(d_out_3, 0, sizeof(half) * (size_t)HEAD_NUM * HEAD_DIM));
-    // topk_attn_block_specialization_kernel<<<grid_fused, block_fused, bs_shmem_bytes>>>(d_out_3, d_k, d_v, d_q, d_centers);
-    // CUDA_CHECK(cudaDeviceSynchronize());
-    // for (int i = 0; i < warmup_bs; ++i) {
-        // topk_attn_block_specialization_kernel<<<grid_fused, block_fused, bs_shmem_bytes>>>(d_out_3, d_k, d_v, d_q, d_centers);
-    // }
-    // CUDA_CHECK(cudaDeviceSynchronize());
-    // cudaEvent_t st_bs, ed_bs; cudaEventCreate(&st_bs); cudaEventCreate(&ed_bs);
-    // CUDA_CHECK(cudaMemset(d_out_3, 0, sizeof(half) * (size_t)HEAD_NUM * HEAD_DIM));
-    // cudaEventRecord(st_bs);
-    // for (int i = 0; i < iters_bs; ++i) {
-        // topk_attn_block_specialization_kernel<<<grid_fused, block_fused, bs_shmem_bytes>>>(d_out_3, d_k, d_v, d_q, d_centers);
-    // }
-    // cudaEventRecord(ed_bs); cudaEventSynchronize(ed_bs); cudaEventElapsedTime(&ms_bs, st_bs, ed_bs);
-    // printf("baseline 3 latency: %.3f us\n", (ms_bs / iters_bs) * 1000.0f);
+    int warmup_bs = 5, iters_bs = 50; float ms_bs = 0.f;
+    CUDA_CHECK(cudaMemset(d_out_3, 0, sizeof(half) * (size_t)HEAD_NUM * HEAD_DIM));
+    topk_attn_block_specialization_kernel<<<grid_bs, block_bs, bs_shmem_bytes>>>(d_out_3, d_k, d_v, d_q, d_centers);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    for (int i = 0; i < warmup_bs; ++i) {
+        topk_attn_block_specialization_kernel<<<grid_bs, block_bs, bs_shmem_bytes>>>(d_out_3, d_k, d_v, d_q, d_centers);
+    }
+    CUDA_CHECK(cudaDeviceSynchronize());
+    cudaEvent_t st_bs, ed_bs; cudaEventCreate(&st_bs); cudaEventCreate(&ed_bs);
+    CUDA_CHECK(cudaMemset(d_out_3, 0, sizeof(half) * (size_t)HEAD_NUM * HEAD_DIM));
+    cudaEventRecord(st_bs);
+    for (int i = 0; i < iters_bs; ++i) {
+        topk_attn_block_specialization_kernel<<<grid_bs, block_bs, bs_shmem_bytes>>>(d_out_3, d_k, d_v, d_q, d_centers);
+    }
+    cudaEventRecord(ed_bs); cudaEventSynchronize(ed_bs); cudaEventElapsedTime(&ms_bs, st_bs, ed_bs);
+    printf("baseline 3 latency: %.3f us\n", (ms_bs / iters_bs) * 1000.0f);
+#endif
 
     // ---- Correctness check ----
+#ifdef DEBUG
     // run baseline 1
     CUDA_CHECK(cudaMemset(d_out, 0, sizeof(half) * (size_t)HEAD_NUM * HEAD_DIM));
     gemv_topk_kernel<<<grid_topk, block_topk, gemv_topk_shmem_bytes>>>(d_k, d_q, d_centers, d_kv_indices);
@@ -1697,6 +1697,38 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaMemcpy(h_out.data(), d_out, sizeof(half) * (size_t)HEAD_NUM * HEAD_DIM, cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaMemcpy(h_out_fused.data(), d_out_2, sizeof(half) * (size_t)HEAD_NUM * HEAD_DIM, cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaMemcpy(h_out_bs.data(), d_out_3, sizeof(half) * (size_t)HEAD_NUM * HEAD_DIM, cudaMemcpyDeviceToHost));
+    // Inspect top-k indices produced by baseline 1
+    std::vector<int> h_kv_indices(HEAD_NUM * OUT_PER_HEAD);
+    CUDA_CHECK(cudaMemcpy(
+        h_kv_indices.data(),
+        d_kv_indices,
+        sizeof(int) * static_cast<size_t>(HEAD_NUM) * OUT_PER_HEAD,
+        cudaMemcpyDeviceToHost));
+    printf("【baseline 1 head0 kv_indices[0..15]】: \n");
+    for (int i = 0; i < 16; ++i) {
+        printf("%d ", h_kv_indices[i]);
+    }
+    printf("\n");
+
+    printf("【baseline 1 head0 output[0..15]】: ");
+    printf("\n");
+    for (int i = 0; i < 16; ++i) {
+        printf("%f ", __half2float(h_out[i]));
+    }
+    printf("\n");
+    printf("【baseline 2 head0 output[0..15]】: ");
+    printf("\n");
+    for (int i = 0; i < 16; ++i) {
+        printf("%f ", __half2float(h_out_fused[i]));
+    }
+    printf("\n");
+    printf("【baseline 3 head0 output[0..15]】: ");
+    printf("\n");
+    for (int i = 0; i < 16; ++i) {
+        printf("%f ", __half2float(h_out_bs[i]));
+    }
+    printf("\n");
+
     float max_diff = 0.0f;
     for (size_t i = 0; i < h_out.size(); ++i) {
         float diff = fabsf(__half2float(h_out[i]) - __half2float(h_out_fused[i]));
@@ -1708,29 +1740,14 @@ int main(int argc, char** argv) {
         float diff = fabsf(__half2float(h_out[i]) - __half2float(h_out_bs[i]));
         if (diff > max_diff) max_diff = diff;
     }
-    printf("baseline 1 head0 output[0..15]: ");
-    printf("\n");
-    for (int i = 0; i < 16; ++i) {
-        printf("%f ", __half2float(h_out[i]));
-    }
-    printf("\n");
-    printf("baseline 2 head0 output[0..15]: ");
-    printf("\n");
-    for (int i = 0; i < 16; ++i) {
-        printf("%f ", __half2float(h_out_fused[i]));
-    }
-    printf("\n");
-    printf("baseline 3 head0 output[0..15]: ");
-    printf("\n");
-    for (int i = 0; i < 16; ++i) {
-        printf("%f ", __half2float(h_out_bs[i]));
-    }
-    printf("\n");
+
     printf("max abs diff between baseline_1&3 outputs: %.6f\n", max_diff);
+#endif
 
 	// Cleanup
     cudaFree(d_out); cudaFree(d_kv_indices); cudaFree(d_centers); cudaFree(d_q); cudaFree(d_v); cudaFree(d_k);
     cudaFree(d_out_2);
+    cudaFree(d_out_3);
 	printf("Done.\n");
 	return 0;
 }
