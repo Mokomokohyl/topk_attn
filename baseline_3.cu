@@ -64,6 +64,7 @@ static constexpr size_t GEMV_SHARED_BYTES =
 #define SEQ_LEN OUT_PER_HEAD
 #define CLUSTER_SIZE 5
 #define KV_DIM_PER_BLOCK (SEQ_LEN / CLUSTER_SIZE) // 512
+#define KV_DIM_PER_BLOCK_BS (SEQ_LEN / (CLUSTER_SIZE - 1)) // 640
 
 #define NUM_WARPS 4
 #define WARP_SIZE 32
@@ -1062,7 +1063,10 @@ __global__ void __cluster_dims__(CLUSTER_SIZE, 1, 1) topk_attn_block_specializat
 
     // Init shared memory
     // store selected kv indices in shared memory
-    __shared__ int kv_indices[TOPC * TOPK_PER_CLUSTER];
+    __shared__ __align__(16) int kv_indices[TOPC * TOPK_PER_CLUSTER];
+    __shared__ __align__(16) int lock;
+    int *dst_shmem;
+    lock = 0;
 
     extern __shared__ uint8_t shmem_base[];
     if (cluster_block_id == CLUSTER_SIZE - 1) {
@@ -1252,7 +1256,7 @@ __global__ void __cluster_dims__(CLUSTER_SIZE, 1, 1) topk_attn_block_specializat
         }
         block.sync();
 
-        // 写回 top-512 的全局索引 (to shared memory buffer)
+        // 写 top-512 的全局索引 (to other cta's shared memory buffer)
         for (int i = tid; i < TOPK_PER_CLUSTER; i += blockDim.x) {
             int local = cand_idx[i];
             int global_idx = c * CLEN + local;
@@ -1260,12 +1264,37 @@ __global__ void __cluster_dims__(CLUSTER_SIZE, 1, 1) topk_attn_block_specializat
         }
         block.sync();
     }
+
+    // write to other cta's shmem
+    for (int dst_cta_id = 0; dst_cta_id < cluster.num_blocks() - 1; dst_cta_id++) {
+        dst_shmem = (int *)cluster.map_shared_rank(&kv_indices, dst_cta_id);
+        for (int i = 0; i < 5; i++) {
+            dst_shmem[5 * tid + i] = kv_indices[dst_cta_id * KV_DIM_PER_BLOCK_BS + 5 * tid + i];
+        }
+        block.sync();
+        if (tid == 0) {
+            dst_shmem = cluster.map_shared_rank(&lock, dst_cta_id);
+            *dst_shmem = 1;
+        }
+    }
+
 // end gemv_topk block
     } else {
 // begin flash-decoding blocks
-    for (int i = tid; i < TOPC * TOPK_PER_CLUSTER; i += blockDim.x) {
-        kv_indices[i] = 0;
-    }
+
+    // wait for lock to release
+    while (lock == 0) {
+        __nanosleep(64);
+    };
+    // Print or not will affect final output.
+    // if (head_id == 0 && cluster_block_id == 0 && tid == 0) {
+        // printf("baseline 3 head0 cluster_block_id=0 kv_indices[0..15]: ");
+        // for (int i = 0; i < 16; ++i) {
+            // printf("%d ", kv_indices[i]);
+        // }
+        // printf("\n");
+    // }
+
     block.sync();
     // Init shared memory
     half* weight = reinterpret_cast<half*>((uintptr_t)(shmem_base) + 127 & ~127);
@@ -1308,7 +1337,7 @@ __global__ void __cluster_dims__(CLUSTER_SIZE, 1, 1) topk_attn_block_specializat
     cp_async_commit_group();
 
     // mainloop
-    for (int id = 1; id < KV_DIM_PER_BLOCK / TMA_LOAD_ONCE_ATTN; id++) {
+    for (int id = 1; id < KV_DIM_PER_BLOCK_BS / TMA_LOAD_ONCE_ATTN; id++) {
         for (int j = 0; j < DEC_TILE; j++) {
             cp_async_pred_load_128b(
                 &weight[(id % 2) * TMA_LOAD_ONCE_NUM + (weight_idx_2 + j) * HEAD_DIM + input_idx], 
@@ -1342,7 +1371,7 @@ __global__ void __cluster_dims__(CLUSTER_SIZE, 1, 1) topk_attn_block_specializat
         // For filled zeros
         #pragma unroll
         for (int j = 0; j < DEC_TILE; j++) {
-            if ((KV_DIM_PER_BLOCK * cluster_block_id + (id - 1) * TMA_LOAD_ONCE_ATTN + weight_idx_2 + j) < SEQ_LEN) {
+            if ((KV_DIM_PER_BLOCK_BS * cluster_block_id + (id - 1) * TMA_LOAD_ONCE_ATTN + weight_idx_2 + j) < SEQ_LEN) {
                 qk[j] = ptx_exp2(qk[j] - local_max);
                 local_sum += qk[j];
             }
@@ -1380,7 +1409,7 @@ __global__ void __cluster_dims__(CLUSTER_SIZE, 1, 1) topk_attn_block_specializat
     pre_max = local_max;
     #pragma unroll
     for (int j = 0; j < DEC_TILE; j++) {
-        *(uint4*)(&reg_weight[0]) = *(uint4*)(&weight[((KV_DIM_PER_BLOCK / TMA_LOAD_ONCE_ATTN - 1) % 2) * TMA_LOAD_ONCE_NUM + (weight_idx_2 + j) * HEAD_DIM + input_idx]);
+        *(uint4*)(&reg_weight[0]) = *(uint4*)(&weight[((KV_DIM_PER_BLOCK_BS / TMA_LOAD_ONCE_ATTN - 1) % 2) * TMA_LOAD_ONCE_NUM + (weight_idx_2 + j) * HEAD_DIM + input_idx]);
         qk[j] = 0.0f;
         #pragma unroll
         for (int d = 0; d < NUM_PER_THREAD; d++) {
@@ -1398,7 +1427,7 @@ __global__ void __cluster_dims__(CLUSTER_SIZE, 1, 1) topk_attn_block_specializat
     local_sum *= scale;
     #pragma unroll
     for (int j = 0; j < DEC_TILE; j++) {
-        if ((KV_DIM_PER_BLOCK * cluster_block_id + (KV_DIM_PER_BLOCK / TMA_LOAD_ONCE_ATTN - 1) * TMA_LOAD_ONCE_ATTN + weight_idx_2 + j) < SEQ_LEN) {
+        if ((KV_DIM_PER_BLOCK_BS * cluster_block_id + (KV_DIM_PER_BLOCK_BS / TMA_LOAD_ONCE_ATTN - 1) * TMA_LOAD_ONCE_ATTN + weight_idx_2 + j) < SEQ_LEN) {
             qk[j] = ptx_exp2(qk[j] - local_max);
             local_sum += qk[j];
         }
@@ -1413,7 +1442,7 @@ __global__ void __cluster_dims__(CLUSTER_SIZE, 1, 1) topk_attn_block_specializat
     block.sync();
 
     for (int j = 0; j < DEC_TILE; j++) {
-        *(uint4*)(&reg_weight[0]) = *(uint4*)(&weight[((KV_DIM_PER_BLOCK / TMA_LOAD_ONCE_ATTN - 1) % 2) * TMA_LOAD_ONCE_NUM + TMA_LOAD_ONCE_NUM_ATTN + (weight_idx_2 + j) * HEAD_DIM + input_idx]);
+        *(uint4*)(&reg_weight[0]) = *(uint4*)(&weight[((KV_DIM_PER_BLOCK_BS / TMA_LOAD_ONCE_ATTN - 1) % 2) * TMA_LOAD_ONCE_NUM + TMA_LOAD_ONCE_NUM_ATTN + (weight_idx_2 + j) * HEAD_DIM + input_idx]);
         #pragma unroll
         for (int d = 0; d < NUM_PER_THREAD; d++) {
             // reg_reduce[d] = __hadd(reg_reduce[d], __float2half(qk[j] * __half2float(reg_weight[d])));
@@ -1638,20 +1667,23 @@ int main(int argc, char** argv) {
     CUDA_TRY(cudaFuncSetAttribute(topk_attn_block_specialization_kernel, cudaFuncAttributeNonPortableClusterSizeAllowed, 1));
     CUDA_TRY(cudaFuncSetAttribute(topk_attn_block_specialization_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(bs_shmem_bytes)));
     printf("---- Baseline 3 (topk-attn block specialization kernel) latency test ----\n");
-    int warmup_bs = 5, iters_bs = 50; float ms_bs = 0.f;
-    CUDA_CHECK(cudaMemset(d_out_3, 0, sizeof(half) * (size_t)HEAD_NUM * HEAD_DIM));
-    for (int i = 0; i < warmup_bs; ++i) {
-        topk_attn_block_specialization_kernel<<<grid_fused, block_fused, bs_shmem_bytes>>>(d_out_3, d_k, d_v, d_q, d_centers);
-    }
-    CUDA_CHECK(cudaDeviceSynchronize());
-    cudaEvent_t st_bs, ed_bs; cudaEventCreate(&st_bs); cudaEventCreate(&ed_bs);
-    CUDA_CHECK(cudaMemset(d_out_3, 0, sizeof(half) * (size_t)HEAD_NUM * HEAD_DIM));
-    cudaEventRecord(st_bs);
-    for (int i = 0; i < iters_bs; ++i) {
-        topk_attn_block_specialization_kernel<<<grid_fused, block_fused, bs_shmem_bytes>>>(d_out_3, d_k, d_v, d_q, d_centers);
-    }
-    cudaEventRecord(ed_bs); cudaEventSynchronize(ed_bs); cudaEventElapsedTime(&ms_bs, st_bs, ed_bs);
-    printf("baseline 3 latency: %.3f us\n", (ms_bs / iters_bs) * 1000.0f);
+    // Commented for debugging.
+    // int warmup_bs = 5, iters_bs = 50; float ms_bs = 0.f;
+    // CUDA_CHECK(cudaMemset(d_out_3, 0, sizeof(half) * (size_t)HEAD_NUM * HEAD_DIM));
+    // topk_attn_block_specialization_kernel<<<grid_fused, block_fused, bs_shmem_bytes>>>(d_out_3, d_k, d_v, d_q, d_centers);
+    // CUDA_CHECK(cudaDeviceSynchronize());
+    // for (int i = 0; i < warmup_bs; ++i) {
+        // topk_attn_block_specialization_kernel<<<grid_fused, block_fused, bs_shmem_bytes>>>(d_out_3, d_k, d_v, d_q, d_centers);
+    // }
+    // CUDA_CHECK(cudaDeviceSynchronize());
+    // cudaEvent_t st_bs, ed_bs; cudaEventCreate(&st_bs); cudaEventCreate(&ed_bs);
+    // CUDA_CHECK(cudaMemset(d_out_3, 0, sizeof(half) * (size_t)HEAD_NUM * HEAD_DIM));
+    // cudaEventRecord(st_bs);
+    // for (int i = 0; i < iters_bs; ++i) {
+        // topk_attn_block_specialization_kernel<<<grid_fused, block_fused, bs_shmem_bytes>>>(d_out_3, d_k, d_v, d_q, d_centers);
+    // }
+    // cudaEventRecord(ed_bs); cudaEventSynchronize(ed_bs); cudaEventElapsedTime(&ms_bs, st_bs, ed_bs);
+    // printf("baseline 3 latency: %.3f us\n", (ms_bs / iters_bs) * 1000.0f);
 
     // ---- Correctness check ----
     // run baseline 1
@@ -1684,6 +1716,12 @@ int main(int argc, char** argv) {
     printf("\n");
     for (int i = 0; i < 16; ++i) {
         printf("%f ", __half2float(h_out[i]));
+    }
+    printf("\n");
+    printf("baseline 2 head0 output[0..15]: ");
+    printf("\n");
+    for (int i = 0; i < 16; ++i) {
+        printf("%f ", __half2float(h_out_fused[i]));
     }
     printf("\n");
     printf("baseline 3 head0 output[0..15]: ");
