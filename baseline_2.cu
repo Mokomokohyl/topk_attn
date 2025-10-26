@@ -821,19 +821,15 @@ __global__ void __cluster_dims__(CLUSTER_SIZE, 1, 1) topk_attn_fused_kernel(
     CandidateRadixSort(candidate_sort_storage).SortDescending(cand_scores_local, cand_index_local);
     __syncthreads();
 
+    // 直接写入排序前缀 Top-512 到 kv_indices，避免将 1280 全量写回共享内存
 #pragma unroll
     for (int item = 0; item < CAND_ITEMS_PER_THREAD; ++item) {
-        int idx = tid * CAND_ITEMS_PER_THREAD + item;
-        cand_vals[idx] = cand_scores_local[item];
-        cand_idx[idx] = cand_index_local[item];
-    }
-    __syncthreads();
-
-    // 写回 top-512 的全局索引(to shared memory buffer)
-    for (int i = tid; i < TOPK_PER_CLUSTER; i += blockDim.x) {
-        int local = cand_idx[i];
-        int global_idx = c * CLEN + local;
-        kv_indices[i] = global_idx;
+        int idx = tid * CAND_ITEMS_PER_THREAD + item; // 排序后全局位置
+        if (idx < TOPK_PER_CLUSTER) {
+            int local = cand_index_local[item];
+            int global_idx = c * CLEN + local;
+            kv_indices[idx] = global_idx;
+        }
     }
     __syncthreads();
 
