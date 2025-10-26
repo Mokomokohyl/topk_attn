@@ -132,9 +132,7 @@ __global__ void gemv_topk_kernel(const __half* __restrict__ kv,
     constexpr int BLOCK_THREADS = 128;
     constexpr int CAND_ITEMS_PER_THREAD = CLEN / BLOCK_THREADS;
     static_assert(CLEN % BLOCK_THREADS == 0, "CLEN must be divisible by BLOCK_THREADS");
-    using CenterRadixSort = cub::BlockRadixSort<float, BLOCK_THREADS, 1, int>;
     using CandidateRadixSort = cub::BlockRadixSort<float, BLOCK_THREADS, CAND_ITEMS_PER_THREAD, int>;
-    __shared__ typename CenterRadixSort::TempStorage center_sort_storage;
     __shared__ typename CandidateRadixSort::TempStorage candidate_sort_storage;
 
     if (blockDim.x != BLOCK_THREADS) {
@@ -194,24 +192,34 @@ __global__ void gemv_topk_kernel(const __half* __restrict__ kv,
         center_idx[16 + weight_idx_0 + i] = 16 + weight_idx_0 + i;
     }
     __syncthreads();
-    
-    if (tid < CENTER_SORT_CAP && tid >= CSZ) {
-        center_vals[tid] = -INFINITY;
-        center_idx[tid] = -1;
-    }
-    __syncthreads();
 
-    // Radix sort
-    float center_score_arr[1];
-    int center_id_arr[1];
-    center_score_arr[0] = (tid < CENTER_SORT_CAP) ? center_vals[tid] : -INFINITY;
-    center_id_arr[0] = (tid < CENTER_SORT_CAP) ? center_idx[tid] : -1;
-    CenterRadixSort(center_sort_storage).SortDescending(center_score_arr, center_id_arr);
-    __syncthreads();
-
-    if (tid < CENTER_SORT_CAP) {
-        center_vals[tid] = center_score_arr[0];
-        center_idx[tid] = center_id_arr[0];
+    // Warp-level Top-5 selection
+    if (tid < 32) {
+        float my_val = (tid < CSZ) ? center_vals[tid] : -CUDART_INF_F;
+        int my_id = (tid < CSZ) ? center_idx[tid] : -1;
+        unsigned mask = 0xffffffffu;
+        #pragma unroll
+        for (int sel = 0; sel < TOPC; ++sel) {
+            // warp-wide argmax on (my_val, my_id)
+            float best_val = my_val;
+            int best_id = my_id;
+            #pragma unroll
+            for (int offs = 16; offs > 0; offs >>= 1) {
+                float o_val = __shfl_xor_sync(mask, best_val, offs);
+                int   o_id  = __shfl_xor_sync(mask, best_id,  offs);
+                if (o_val > best_val) { best_val = o_val; best_id = o_id; }
+            }
+            // broadcast winner id from lane 0
+            int winner_id = __shfl_sync(mask, best_id, 0);
+            if (lane_id == 0) {
+                center_idx[sel] = winner_id; // store top-order center ids in [0..TOPC-1]
+            }
+            // invalidate winner locally for next round
+            if (my_id == winner_id) {
+                my_val = -CUDART_INF_F;
+            }
+            __syncwarp();
+        }
     }
     __syncthreads();
 
