@@ -132,9 +132,7 @@ __global__ void gemv_topk_kernel(const __half* __restrict__ kv,
 
     constexpr int CAND_ITEMS_PER_THREAD = CLEN / BLOCK_SIZE;
     static_assert(CLEN % BLOCK_SIZE == 0, "CLEN must be divisible by BLOCK_SIZE");
-    using CenterRadixSort = cub::BlockRadixSort<float, BLOCK_SIZE, 1, int>;
     using CandidateRadixSort = cub::BlockRadixSort<float, BLOCK_SIZE, CAND_ITEMS_PER_THREAD, int>;
-    __shared__ typename CenterRadixSort::TempStorage center_sort_storage;
     __shared__ typename CandidateRadixSort::TempStorage candidate_sort_storage;
 
     // Load q into reg
@@ -191,23 +189,31 @@ __global__ void gemv_topk_kernel(const __half* __restrict__ kv,
     }
     __syncthreads();
     
-    if (tid < CENTER_SORT_CAP && tid >= CSZ) {
-        center_vals[tid] = -INFINITY;
-        center_idx[tid] = -1;
-    }
-    __syncthreads();
-
-    // Radix sort
-    float center_score_arr[1];
-    int center_id_arr[1];
-    center_score_arr[0] = (tid < CENTER_SORT_CAP) ? center_vals[tid] : -INFINITY;
-    center_id_arr[0] = (tid < CENTER_SORT_CAP) ? center_idx[tid] : -1;
-    CenterRadixSort(center_sort_storage).SortDescending(center_score_arr, center_id_arr);
-    __syncthreads();
-
-    if (tid < CENTER_SORT_CAP) {
-        center_vals[tid] = center_score_arr[0];
-        center_idx[tid] = center_id_arr[0];
+    // Warp-level Top-5 selection
+    static_assert(TOPC <= CENTER_SORT_CAP, "TOPC must be <= CENTER_SORT_CAP");
+    if (tid < 32) {
+        float my_val = (tid < CSZ) ? center_vals[tid] : -CUDART_INF_F;
+        int my_id = (tid < CSZ) ? center_idx[tid] : -1;
+        unsigned mask = 0xffffffffu;
+        #pragma unroll
+        for (int sel = 0; sel < TOPC; ++sel) {
+            float best_val = my_val;
+            int best_id = my_id;
+            #pragma unroll
+            for (int offs = 16; offs > 0; offs >>= 1) {
+                float o_val = __shfl_xor_sync(mask, best_val, offs);
+                int   o_id  = __shfl_xor_sync(mask, best_id,  offs);
+                if (o_val > best_val) { best_val = o_val; best_id = o_id; }
+            }
+            int winner_id = __shfl_sync(mask, best_id, 0);
+            if (lane_id == 0) {
+                center_idx[sel] = winner_id; // top-k centers stored in order
+            }
+            if (my_id == winner_id) {
+                my_val = -CUDART_INF_F;
+            }
+            __syncwarp();
+        }
     }
     __syncthreads();
 
@@ -609,6 +615,10 @@ __global__ void __cluster_dims__(CLUSTER_SIZE, 1, 1) topk_attn_fused_kernel(
     __shared__ float cluster_local_sum, cluster_local_max;
     // store selected kv indices in shared memory in fused kernel
     __shared__ int kv_indices[TOPK_PER_CLUSTER];
+    // leader keeps top-5 center ids here; others map to leader's copy
+    __shared__ int center_topk[TOPC];
+    // broadcast selected center id from leader CTA to all CTAs
+    __shared__ int assigned_center;
 
     block.sync();
 
@@ -632,88 +642,110 @@ __global__ void __cluster_dims__(CLUSTER_SIZE, 1, 1) topk_attn_fused_kernel(
     // for cub::BlockRadixSort
     constexpr int CAND_ITEMS_PER_THREAD = CLEN / BLOCK_SIZE;
     static_assert(CLEN % BLOCK_SIZE == 0, "CLEN must be divisible by BLOCK_SIZE");
-    using CenterRadixSort = cub::BlockRadixSort<float, BLOCK_SIZE, 1, int>;
     using CandidateRadixSort = cub::BlockRadixSort<float, BLOCK_SIZE, CAND_ITEMS_PER_THREAD, int>;
-    __shared__ typename CenterRadixSort::TempStorage center_sort_storage;
     __shared__ typename CandidateRadixSort::TempStorage candidate_sort_storage;
     
     // Load q into reg_input
     *(uint4*)(&reg_input[0]) = *(uint4*)(&q[cluster_head_idx + input_idx]);
     // ---------------- STAGE 1: gemv topk ----------------
 
-    // Phase 1: 使用传入的聚类中心，直接计算每个中心分数  score_c = dot(q, center[h,c,:])
-    for (int i = 0; i < 2; i++) {
-        cp_async_pred_load_128b(
-            &k_buffer[(weight_idx_0 + i) * HEAD_DIM + input_idx],
-            &centers[head_id * CSZ * HEAD_DIM + (weight_idx_0 + i) * HEAD_DIM + input_idx],
-            (weight_idx_0 + i < CSZ)
-        );
-    }
-    cp_async_commit_group();
-    for (int i = 0; i < 2; i++) {
-        cp_async_pred_load_128b(
-            &k_buffer[(16 + weight_idx_0 + i) * HEAD_DIM + input_idx],
-            &centers[head_id * CSZ * HEAD_DIM + (16 + weight_idx_0 + i) * HEAD_DIM + input_idx],
-            (16 + weight_idx_0 + i < CSZ)
-        );
-    }
-    cp_async_commit_group();
-    cp_async_wait_group<1>();
-    __syncthreads();
-    for (int i = 0; i < 2; i++) {
-        *(uint4*)(&reg_weight[0]) = *(uint4*)(&k_buffer[(weight_idx_0 + i) * HEAD_DIM + input_idx]);
-        qk[i] = 0.0f;
-        #pragma unroll
-        for (int d = 0; d < 8; d++) {
-            qk[i] += __half2float(reg_input[d]) * __half2float(reg_weight[d]);
+    // Phase 1: center scoring and Top-5 selection (leader CTA computes once, then cluster-broadcast)
+    if (cluster_block_id == 0) {
+        // Compute 32 center scores into center_vals and write their ids into center_idx
+        for (int i = 0; i < 2; i++) {
+            cp_async_pred_load_128b(
+                &k_buffer[(weight_idx_0 + i) * HEAD_DIM + input_idx],
+                &centers[head_id * CSZ * HEAD_DIM + (weight_idx_0 + i) * HEAD_DIM + input_idx],
+                (weight_idx_0 + i < CSZ)
+            );
         }
-        #pragma unroll
-        for (int mask = (16 >> 1); mask > 0; mask >>= 1) {
-            qk[i] += __shfl_xor_sync(0xffffffff, qk[i], mask);
+        cp_async_commit_group();
+        for (int i = 0; i < 2; i++) {
+            cp_async_pred_load_128b(
+                &k_buffer[(16 + weight_idx_0 + i) * HEAD_DIM + input_idx],
+                &centers[head_id * CSZ * HEAD_DIM + (16 + weight_idx_0 + i) * HEAD_DIM + input_idx],
+                (16 + weight_idx_0 + i < CSZ)
+            );
         }
-        center_vals[weight_idx_0 + i] = qk[i];
-        center_idx[weight_idx_0 + i] = weight_idx_0 + i;
-    }
-    cp_async_wait_group<0>();
-    __syncthreads();
-    for (int i = 0; i < 2; i++) {
-        *(uint4*)(&reg_weight[0]) = *(uint4*)(&k_buffer[(16 + weight_idx_0 + i) * HEAD_DIM + input_idx]);
-        qk[i] = 0.0f;
-        #pragma unroll
-        for (int d = 0; d < 8; d++) {
-            qk[i] += __half2float(reg_input[d]) * __half2float(reg_weight[d]);
+        cp_async_commit_group();
+        cp_async_wait_group<1>();
+        __syncthreads();
+        for (int i = 0; i < 2; i++) {
+            *(uint4*)(&reg_weight[0]) = *(uint4*)(&k_buffer[(weight_idx_0 + i) * HEAD_DIM + input_idx]);
+            qk[i] = 0.0f;
+            #pragma unroll
+            for (int d = 0; d < 8; d++) {
+                qk[i] += __half2float(reg_input[d]) * __half2float(reg_weight[d]);
+            }
+            #pragma unroll
+            for (int mask = (16 >> 1); mask > 0; mask >>= 1) {
+                qk[i] += __shfl_xor_sync(0xffffffff, qk[i], mask);
+            }
+            center_vals[weight_idx_0 + i] = qk[i];
+            center_idx[weight_idx_0 + i] = weight_idx_0 + i;
         }
-        #pragma unroll
-        for (int mask = (16 >> 1); mask > 0; mask >>= 1) {
-            qk[i] += __shfl_xor_sync(0xffffffff, qk[i], mask);
+        cp_async_wait_group<0>();
+        __syncthreads();
+        for (int i = 0; i < 2; i++) {
+            *(uint4*)(&reg_weight[0]) = *(uint4*)(&k_buffer[(16 + weight_idx_0 + i) * HEAD_DIM + input_idx]);
+            qk[i] = 0.0f;
+            #pragma unroll
+            for (int d = 0; d < 8; d++) {
+                qk[i] += __half2float(reg_input[d]) * __half2float(reg_weight[d]);
+            }
+            #pragma unroll
+            for (int mask = (16 >> 1); mask > 0; mask >>= 1) {
+                qk[i] += __shfl_xor_sync(0xffffffff, qk[i], mask);
+            }
+            center_vals[16 + weight_idx_0 + i] = qk[i];
+            center_idx[16 + weight_idx_0 + i] = 16 + weight_idx_0 + i;
         }
-        center_vals[16 + weight_idx_0 + i] = qk[i];
-        center_idx[16 + weight_idx_0 + i] = 16 + weight_idx_0 + i;
-    }
-    __syncthreads();
-    
-    if (tid < CENTER_SORT_CAP && tid >= CSZ) {
-        center_vals[tid] = -INFINITY;
-        center_idx[tid] = -1;
-    }
-    __syncthreads();
+        __syncthreads();
 
-    // Radix sort center scores
-    float center_score_arr[1];
-    int center_id_arr[1];
-    center_score_arr[0] = (tid < CENTER_SORT_CAP) ? center_vals[tid] : -INFINITY;
-    center_id_arr[0] = (tid < CENTER_SORT_CAP) ? center_idx[tid] : -1;
-    CenterRadixSort(center_sort_storage).SortDescending(center_score_arr, center_id_arr);
-    __syncthreads();
-
-    if (tid < CENTER_SORT_CAP) {
-        center_vals[tid] = center_score_arr[0];
-        center_idx[tid] = center_id_arr[0];
+        // Warp-level Top-5 selection for centers (only leader performs)
+        static_assert(TOPC <= CENTER_SORT_CAP, "TOPC must be <= CENTER_SORT_CAP");
+        if (tid < 32) {
+            float my_val = (tid < CSZ) ? center_vals[tid] : -CUDART_INF_F;
+            int my_id = (tid < CSZ) ? center_idx[tid] : -1;
+            unsigned mask = 0xffffffffu;
+            #pragma unroll
+            for (int sel = 0; sel < TOPC; ++sel) {
+                float best_val = my_val;
+                int best_id = my_id;
+                #pragma unroll
+                for (int offs = 16; offs > 0; offs >>= 1) {
+                    float o_val = __shfl_xor_sync(mask, best_val, offs);
+                    int   o_id  = __shfl_xor_sync(mask, best_id,  offs);
+                    if (o_val > best_val) { best_val = o_val; best_id = o_id; }
+                }
+                int winner_id = __shfl_sync(mask, best_id, 0);
+                if (lane_id == 0) {
+                    center_idx[sel] = winner_id;
+                    center_topk[sel] = winner_id;
+                }
+                if (my_id == winner_id) {
+                    my_val = -CUDART_INF_F;
+                }
+                __syncwarp();
+            }
+        }
+        __syncthreads();
     }
-    __syncthreads();
+    // Ensure leader finished computing top-5
+    cluster.sync();
+    // Map leader's center_topk just once and fetch this CTA's assigned center id
+    int* leader_topk_ptr = nullptr;
+    if (tid == 0) {
+        leader_topk_ptr = cluster.map_shared_rank(center_topk, 0);
+    }
+    cluster.sync();
+    if (tid == 0) {
+        assigned_center = leader_topk_ptr[cluster_block_id];
+    }
+    block.sync();
 
     // Phase 2: this block handles its assigned top-r cluster index
-    int c = center_idx[cluster_block_id];
+    int c = assigned_center;
     // 计算所有 token 的分数：每个线程计算若干 t 并写入共享内存
     
     // preload k
