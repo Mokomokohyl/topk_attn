@@ -1089,7 +1089,7 @@ __global__ void __cluster_dims__(CLUSTER_SIZE, 1, 1) topk_attn_block_specializat
     extern __shared__ uint8_t shmem_base[];
 
     if (cluster_block_id == CLUSTER_SIZE - 1) {
-// begin gemv_topk block 
+    // begin gemv_topk block 
     // Init shared memory
     half* k_buffer = reinterpret_cast<half*>(shmem_base);
     float* center_vals = reinterpret_cast<float*>(k_buffer + GEMV_SHARED_K_BUFFER_ELEMS);
@@ -1284,22 +1284,22 @@ __global__ void __cluster_dims__(CLUSTER_SIZE, 1, 1) topk_attn_block_specializat
         block.sync();
     }
 
-    // write to other cta's shmem
-    for (int dst_cta_id = 0; dst_cta_id < cluster.num_blocks() - 1; dst_cta_id++) {
-        dst_shmem = (int *)cluster.map_shared_rank(&kv_indices, dst_cta_id);
-        for (int i = 0; i < 5; i++) {
-            dst_shmem[5 * tid + i] = kv_indices[dst_cta_id * KV_DIM_PER_BLOCK_BS + 5 * tid + i];
+        // write to other cta's shmem
+        for (int dst_cta_id = 0; dst_cta_id < cluster.num_blocks() - 1; dst_cta_id++) {
+            dst_shmem = (int *)cluster.map_shared_rank(&kv_indices, dst_cta_id);
+            for (int i = 0; i < 5; i++) {
+                dst_shmem[5 * tid + i] = kv_indices[dst_cta_id * KV_DIM_PER_BLOCK_BS + 5 * tid + i];
+            }
+            block.sync();
+            if (tid == 0) {
+                dst_shmem = cluster.map_shared_rank(&lock, dst_cta_id);
+                *dst_shmem = 1;
+            }
         }
-        block.sync();
-        if (tid == 0) {
-            dst_shmem = cluster.map_shared_rank(&lock, dst_cta_id);
-            *dst_shmem = 1;
-        }
-    }
 
-// end gemv_topk block
+    // end gemv_topk block
     } else {
-// begin flash-decoding blocks
+    // begin flash-decoding blocks
 
     // wait for lock to release
     while (*lock_ptr == 0) {
@@ -1552,7 +1552,7 @@ __global__ void __cluster_dims__(CLUSTER_SIZE, 1, 1) topk_attn_block_specializat
     block.sync();
 
     atomicAdd(&output[head_id * HEAD_DIM + tid], local_output[tid]);
-// end flash-decoding block
+    // end flash-decoding block
     }
 }
 
