@@ -1624,6 +1624,28 @@ int main(int argc, char** argv) {
     }
     cudaEventRecord(ed_combo); cudaEventSynchronize(ed_combo); cudaEventElapsedTime(&ms_combo, st_combo, ed_combo);
     printf("baseline 1 latency: %.3f us\n", (ms_combo / iters_combo) * 1000.0f);
+
+	int warmup_topk = 5, iters_topk = 20; float ms_topk = 0.f;
+	for (int i = 0; i < warmup_topk; ++i) gemv_topk_kernel<<<grid_topk, block_topk, gemv_topk_shmem_bytes>>>(d_k, d_q, d_centers, d_kv_indices);
+	CUDA_CHECK(cudaDeviceSynchronize());
+	cudaEvent_t st1, ed1; cudaEventCreate(&st1); cudaEventCreate(&ed1);
+	cudaEventRecord(st1);
+    for (int i = 0; i < iters_topk; ++i) gemv_topk_kernel<<<grid_topk, block_topk, gemv_topk_shmem_bytes>>>(d_k, d_q, d_centers, d_kv_indices);
+	cudaEventRecord(ed1); cudaEventSynchronize(ed1); cudaEventElapsedTime(&ms_topk, st1, ed1);
+	printf("gemv_topk (indices build) latency: %.3f us\n", (ms_topk / iters_topk) * 1000.0f);
+
+	int warmup_dec = 10, iters_dec = 50; float ms_dec = 0.f;
+	for (int i = 0; i < warmup_dec; ++i) {
+		MHAFlashDecodeKernel<<<grid_dec, block_dec, max_shmem_size>>>(d_out, d_q, d_k, d_v, d_kv_indices);
+	}
+	CUDA_CHECK(cudaDeviceSynchronize());
+	cudaEvent_t st2, ed2; cudaEventCreate(&st2); cudaEventCreate(&ed2);
+	cudaEventRecord(st2);
+	for (int i = 0; i < iters_dec; ++i) {
+		MHAFlashDecodeKernel<<<grid_dec, block_dec, max_shmem_size>>>(d_out, d_q, d_k, d_v, d_kv_indices);
+	}
+	cudaEventRecord(ed2); cudaEventSynchronize(ed2); cudaEventElapsedTime(&ms_dec, st2, ed2);
+	printf("flash decode latency: %.3f us\n", (ms_dec / iters_dec) * 1000.0f);
 #endif
 
 
