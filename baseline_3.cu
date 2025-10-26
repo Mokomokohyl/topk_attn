@@ -22,7 +22,7 @@ namespace cde = cuda::device::experimental;
 namespace cg = cooperative_groups;
 
 // DEBUG macro
-#define DEBUG
+// #define DEBUG
 
 #define CUDA_CHECK(call) do { \
 	cudaError_t err = (call); \
@@ -1315,7 +1315,7 @@ __global__ void __cluster_dims__(CLUSTER_SIZE, 1, 1) topk_attn_block_specializat
 
     // wait for lock to release
     while (*lock_ptr == 0) {
-        __nanosleep(32);
+        __nanosleep(1);
     };
     // Print or not will affect final output. NOTE: fixed after dereference lock with lock_ptr defined as below
     // volatile int* lock_ptr = &lock;
@@ -1356,13 +1356,12 @@ __global__ void __cluster_dims__(CLUSTER_SIZE, 1, 1) topk_attn_block_specializat
     // indices for flash-decoding
     const uint32_t weight_idx_2 = warp_id * NUM_ROW_PER_WARP_2 + (lane_id / NUM_THREAD_PER_ROW_2) * DEC_TILE;
 
-    // CRITICAL FIX: Load q into reg_input for flash-decoding computation!
-    *(uint4*)(&reg_input[0]) = *(uint4*)(&q[cluster_head_idx + input_idx]);
-
     // Compute flash-decoding
     local_sum = 0.0f;
     for(int i = 0; i < NUM_PER_THREAD; i++)
         reg_reduce[i] = 0.0f;
+    // CRITICAL FIX: Load q into reg_input for flash-decoding computation!
+    *(uint4*)(&reg_input[0]) = *(uint4*)(&q[cluster_head_idx + input_idx]);
     block.sync();
 
     // Preload kv_cache - flash-decoding blocks use their local kv_indices directly (no offset needed)
