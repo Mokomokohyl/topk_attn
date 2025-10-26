@@ -13,8 +13,7 @@
 // block 0 cluster_max -> 30.000000
 // block 1 cluster_max -> 30.000000
 
-// 看起来传递的锁能正常工作，cluster.sync()不会报错但没有正常工作。也可能是尝试reduce的操作没有写对。
-
+// 看起来cluster.sync()也可以正常工作
 
 #include <cstdio>
 #include <vector>
@@ -72,7 +71,7 @@ __global__ void __cluster_dims__(CLUSTER_SIZE, 1, 1) block_specialization_kernel
 
         // clutser reduce: sum
         if (tid == 0) {
-            cluster_sum = 0.0f;
+            cluster_sum = value;
         }
         cluster.sync();
         for (int id = 1; id < cluster.num_blocks() - 1; id++) {
@@ -91,7 +90,7 @@ __global__ void __cluster_dims__(CLUSTER_SIZE, 1, 1) block_specialization_kernel
         }
 
         if (tid == 0) {
-            cluster_max = 0.0f;
+            cluster_max = value;
         }
         cluster.sync();
         // cluster reduce: max
@@ -153,7 +152,7 @@ __global__ void __cluster_dims__(CLUSTER_SIZE, 1, 1) block_specialization_kernel
 
         // clutser reduce: sum
         if (tid == 0) {
-            cluster_sum = 0.0f;
+            cluster_sum = value;
             atomicAdd((int *)global_lock_ptr, 1);
         }
         while (*global_lock_ptr != 4) {
@@ -181,7 +180,7 @@ __global__ void __cluster_dims__(CLUSTER_SIZE, 1, 1) block_specialization_kernel
         }
 
         if (tid == 0) {
-            cluster_max = 0.0f;
+            cluster_max = value;
         }
         cluster.sync();
         // cluster reduce: max
