@@ -1,19 +1,4 @@
 // nvcc -std=c++17 -arch=sm_90a cluster_sync_test.cu -o cluster_sync_test && ./cluster_sync_test && rm cluster_sync_test
-// Terminal output:
-// block 2 value -> 20.000000
-// block 0 value -> 0.000000
-// block 3 value -> 30.000000
-// block 1 value -> 10.000000
-// block 3 cluster_sum -> 30.000000
-// block 2 cluster_sum -> 40.000000
-// block 0 cluster_sum -> 60.000000
-// block 1 cluster_sum -> 50.000000
-// block 3 cluster_max -> 20.000000
-// block 2 cluster_max -> 30.000000
-// block 0 cluster_max -> 30.000000
-// block 1 cluster_max -> 30.000000
-
-// 看起来cluster.sync()也可以正常工作
 
 #include <cstdio>
 #include <vector>
