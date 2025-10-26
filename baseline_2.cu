@@ -132,9 +132,7 @@ __global__ void gemv_topk_kernel(const __half* __restrict__ kv,
 
     constexpr int CAND_ITEMS_PER_THREAD = CLEN / BLOCK_SIZE;
     static_assert(CLEN % BLOCK_SIZE == 0, "CLEN must be divisible by BLOCK_SIZE");
-    using CenterRadixSort = cub::BlockRadixSort<float, BLOCK_SIZE, 1, int>;
     using CandidateRadixSort = cub::BlockRadixSort<float, BLOCK_SIZE, CAND_ITEMS_PER_THREAD, int>;
-    __shared__ typename CenterRadixSort::TempStorage center_sort_storage;
     __shared__ typename CandidateRadixSort::TempStorage candidate_sort_storage;
 
     // Load q into reg
@@ -191,23 +189,31 @@ __global__ void gemv_topk_kernel(const __half* __restrict__ kv,
     }
     __syncthreads();
     
-    if (tid < CENTER_SORT_CAP && tid >= CSZ) {
-        center_vals[tid] = -INFINITY;
-        center_idx[tid] = -1;
-    }
-    __syncthreads();
-
-    // Radix sort
-    float center_score_arr[1];
-    int center_id_arr[1];
-    center_score_arr[0] = (tid < CENTER_SORT_CAP) ? center_vals[tid] : -INFINITY;
-    center_id_arr[0] = (tid < CENTER_SORT_CAP) ? center_idx[tid] : -1;
-    CenterRadixSort(center_sort_storage).SortDescending(center_score_arr, center_id_arr);
-    __syncthreads();
-
-    if (tid < CENTER_SORT_CAP) {
-        center_vals[tid] = center_score_arr[0];
-        center_idx[tid] = center_id_arr[0];
+    // Warp-level Top-5 selection
+    static_assert(TOPC <= CENTER_SORT_CAP, "TOPC must be <= CENTER_SORT_CAP");
+    if (tid < 32) {
+        float my_val = (tid < CSZ) ? center_vals[tid] : -CUDART_INF_F;
+        int my_id = (tid < CSZ) ? center_idx[tid] : -1;
+        unsigned mask = 0xffffffffu;
+        #pragma unroll
+        for (int sel = 0; sel < TOPC; ++sel) {
+            float best_val = my_val;
+            int best_id = my_id;
+            #pragma unroll
+            for (int offs = 16; offs > 0; offs >>= 1) {
+                float o_val = __shfl_xor_sync(mask, best_val, offs);
+                int   o_id  = __shfl_xor_sync(mask, best_id,  offs);
+                if (o_val > best_val) { best_val = o_val; best_id = o_id; }
+            }
+            int winner_id = __shfl_sync(mask, best_id, 0);
+            if (lane_id == 0) {
+                center_idx[sel] = winner_id; // top-k centers stored in order
+            }
+            if (my_id == winner_id) {
+                my_val = -CUDART_INF_F;
+            }
+            __syncwarp();
+        }
     }
     __syncthreads();
 
@@ -632,9 +638,7 @@ __global__ void __cluster_dims__(CLUSTER_SIZE, 1, 1) topk_attn_fused_kernel(
     // for cub::BlockRadixSort
     constexpr int CAND_ITEMS_PER_THREAD = CLEN / BLOCK_SIZE;
     static_assert(CLEN % BLOCK_SIZE == 0, "CLEN must be divisible by BLOCK_SIZE");
-    using CenterRadixSort = cub::BlockRadixSort<float, BLOCK_SIZE, 1, int>;
     using CandidateRadixSort = cub::BlockRadixSort<float, BLOCK_SIZE, CAND_ITEMS_PER_THREAD, int>;
-    __shared__ typename CenterRadixSort::TempStorage center_sort_storage;
     __shared__ typename CandidateRadixSort::TempStorage candidate_sort_storage;
     
     // Load q into reg_input
@@ -692,23 +696,31 @@ __global__ void __cluster_dims__(CLUSTER_SIZE, 1, 1) topk_attn_fused_kernel(
     }
     __syncthreads();
     
-    if (tid < CENTER_SORT_CAP && tid >= CSZ) {
-        center_vals[tid] = -INFINITY;
-        center_idx[tid] = -1;
-    }
-    __syncthreads();
-
-    // Radix sort center scores
-    float center_score_arr[1];
-    int center_id_arr[1];
-    center_score_arr[0] = (tid < CENTER_SORT_CAP) ? center_vals[tid] : -INFINITY;
-    center_id_arr[0] = (tid < CENTER_SORT_CAP) ? center_idx[tid] : -1;
-    CenterRadixSort(center_sort_storage).SortDescending(center_score_arr, center_id_arr);
-    __syncthreads();
-
-    if (tid < CENTER_SORT_CAP) {
-        center_vals[tid] = center_score_arr[0];
-        center_idx[tid] = center_id_arr[0];
+    // Warp-level Top-5 selection for centers
+    static_assert(TOPC <= CENTER_SORT_CAP, "TOPC must be <= CENTER_SORT_CAP");
+    if (tid < 32) {
+        float my_val = (tid < CSZ) ? center_vals[tid] : -CUDART_INF_F;
+        int my_id = (tid < CSZ) ? center_idx[tid] : -1;
+        unsigned mask = 0xffffffffu;
+        #pragma unroll
+        for (int sel = 0; sel < TOPC; ++sel) {
+            float best_val = my_val;
+            int best_id = my_id;
+            #pragma unroll
+            for (int offs = 16; offs > 0; offs >>= 1) {
+                float o_val = __shfl_xor_sync(mask, best_val, offs);
+                int   o_id  = __shfl_xor_sync(mask, best_id,  offs);
+                if (o_val > best_val) { best_val = o_val; best_id = o_id; }
+            }
+            int winner_id = __shfl_sync(mask, best_id, 0);
+            if (lane_id == 0) {
+                center_idx[sel] = winner_id;
+            }
+            if (my_id == winner_id) {
+                my_val = -CUDART_INF_F;
+            }
+            __syncwarp();
+        }
     }
     __syncthreads();
 
