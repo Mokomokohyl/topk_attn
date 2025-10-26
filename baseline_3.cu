@@ -22,7 +22,7 @@ namespace cde = cuda::device::experimental;
 namespace cg = cooperative_groups;
 
 // DEBUG macro
-// #define DEBUG
+#define DEBUG
 
 #define CUDA_CHECK(call) do { \
 	cudaError_t err = (call); \
@@ -61,7 +61,9 @@ static constexpr size_t GEMV_SHARED_BYTES =
     sizeof(float) * CENTER_SORT_CAP +
     sizeof(int) * CENTER_SORT_CAP +
     sizeof(float) * CLEN +
-    sizeof(int) * CLEN;
+    sizeof(int) * CLEN +
+    sizeof(int) * (TOPC * TOPK_PER_CLUSTER);  // full_kv_indices for gemv-topk block
+
 
 // ---- Flash decoding constants ----
 #define SEQ_LEN OUT_PER_HEAD
@@ -1079,23 +1081,29 @@ __global__ void __cluster_dims__(CLUSTER_SIZE, 1, 1) topk_attn_block_specializat
     const uint32_t cluster_head_idx = head_id * HEAD_DIM;
 
     // Init shared memory
-    // store selected kv indices in shared memory
-    __shared__ __align__(16) int kv_indices[TOPC * TOPK_PER_CLUSTER];
+    // Flash-decoding blocks only need KV_DIM_PER_BLOCK_BS indices
+    // Gemv-topk block needs full TOPC * TOPK_PER_CLUSTER space
+    __shared__ __align__(16) int kv_indices[KV_DIM_PER_BLOCK_BS];
     __shared__ __align__(16) int lock;
     volatile int* lock_ptr = &lock;
     int *dst_shmem;
-    lock = 0;
+    
+    if (cluster_block_id != CLUSTER_SIZE - 1) {
+        lock = 0;  // Flash-decoding blocks initialize lock to 0
+    }
 
     extern __shared__ uint8_t shmem_base[];
 
     if (cluster_block_id == CLUSTER_SIZE - 1) {
     // begin gemv_topk block 
-    // Init shared memory
+    // Init shared memory - gemv-topk block uses dynamic shared memory for full kv_indices array
     half* k_buffer = reinterpret_cast<half*>(shmem_base);
     float* center_vals = reinterpret_cast<float*>(k_buffer + GEMV_SHARED_K_BUFFER_ELEMS);
     int* center_idx = reinterpret_cast<int*>(center_vals + CENTER_SORT_CAP);
     float* cand_vals = reinterpret_cast<float*>(center_idx + CENTER_SORT_CAP);
     int* cand_idx = reinterpret_cast<int*>(cand_vals + CLEN);
+    // Full kv_indices array for gemv-topk block
+    int* full_kv_indices = reinterpret_cast<int*>(cand_idx + CLEN);
 
     // Init registers
     half __align__(16) reg_input[NUM_PER_THREAD], reg_weight[NUM_PER_THREAD];
@@ -1275,11 +1283,11 @@ __global__ void __cluster_dims__(CLUSTER_SIZE, 1, 1) topk_attn_block_specializat
         }
         block.sync();
 
-        // 写 top-512 的全局索引 (to other cta's shared memory buffer)
+        // 写 top-512 的全局索引到 full_kv_indices
         for (int i = tid; i < TOPK_PER_CLUSTER; i += blockDim.x) {
             int local = cand_idx[i];
             int global_idx = c * CLEN + local;
-            kv_indices[j * TOPK_PER_CLUSTER + i] = global_idx;
+            full_kv_indices[j * TOPK_PER_CLUSTER + i] = global_idx;
         }
         block.sync();
     }
@@ -1287,14 +1295,18 @@ __global__ void __cluster_dims__(CLUSTER_SIZE, 1, 1) topk_attn_block_specializat
         // write to other cta's shmem
         for (int dst_cta_id = 0; dst_cta_id < cluster.num_blocks() - 1; dst_cta_id++) {
             dst_shmem = (int *)cluster.map_shared_rank(&kv_indices, dst_cta_id);
-            for (int i = 0; i < 5; i++) {
-                dst_shmem[5 * tid + i] = kv_indices[dst_cta_id * KV_DIM_PER_BLOCK_BS + 5 * tid + i];
+            // Each dst_cta_id should receive KV_DIM_PER_BLOCK_BS indices
+            // Starting at dst_cta_id * KV_DIM_PER_BLOCK_BS in the source full_kv_indices
+            int src_base = dst_cta_id * KV_DIM_PER_BLOCK_BS;
+            for (int i = tid; i < KV_DIM_PER_BLOCK_BS; i += blockDim.x) {
+                dst_shmem[i] = full_kv_indices[src_base + i];
             }
             block.sync();
             if (tid == 0) {
-                dst_shmem = cluster.map_shared_rank(&lock, dst_cta_id);
-                *dst_shmem = 1;
+                volatile int* dst_lock = (volatile int*)cluster.map_shared_rank(&lock, dst_cta_id);
+                *dst_lock = 1;
             }
+            block.sync();
         }
 
     // end gemv_topk block
@@ -1312,6 +1324,14 @@ __global__ void __cluster_dims__(CLUSTER_SIZE, 1, 1) topk_attn_block_specializat
 #ifdef DEBUG
     if (head_id == 0 && cluster_block_id == 0 && tid == 0) {
         printf("baseline 3 head0 cluster_block_id=0 kv_indices[0..15]: ");
+        for (int i = 0; i < 16; ++i) {
+            printf("%d ", kv_indices[i]);
+        }
+        printf("\n");
+        printf("baseline 3 head0 cluster_block_id=0 KV_DIM_PER_BLOCK_BS=%d\n", KV_DIM_PER_BLOCK_BS);
+    }
+    if (head_id == 0 && cluster_block_id == 1 && tid == 0) {
+        printf("baseline 3 head0 cluster_block_id=1 kv_indices[0..15]: ");
         for (int i = 0; i < 16; ++i) {
             printf("%d ", kv_indices[i]);
         }
@@ -1336,13 +1356,16 @@ __global__ void __cluster_dims__(CLUSTER_SIZE, 1, 1) topk_attn_block_specializat
     // indices for flash-decoding
     const uint32_t weight_idx_2 = warp_id * NUM_ROW_PER_WARP_2 + (lane_id / NUM_THREAD_PER_ROW_2) * DEC_TILE;
 
+    // CRITICAL FIX: Load q into reg_input for flash-decoding computation!
+    *(uint4*)(&reg_input[0]) = *(uint4*)(&q[cluster_head_idx + input_idx]);
+
     // Compute flash-decoding
     local_sum = 0.0f;
     for(int i = 0; i < NUM_PER_THREAD; i++)
         reg_reduce[i] = 0.0f;
     block.sync();
 
-    // Preload kv_cache
+    // Preload kv_cache - flash-decoding blocks use their local kv_indices directly (no offset needed)
     for (int j = 0; j < DEC_TILE; j++) {
         cp_async_pred_load_128b(
             &weight[0 + (weight_idx_2 + j) * HEAD_DIM + input_idx], 
@@ -1725,14 +1748,35 @@ int main(int argc, char** argv) {
     // run baseline 1
     CUDA_CHECK(cudaMemset(d_out, 0, sizeof(half) * (size_t)HEAD_NUM * HEAD_DIM));
     gemv_topk_kernel<<<grid_topk, block_topk, gemv_topk_shmem_bytes>>>(d_k, d_q, d_centers, d_kv_indices);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    cudaError_t err1 = cudaGetLastError();
+    if (err1 != cudaSuccess) {
+        printf("baseline 1 gemv_topk_kernel error: %s\n", cudaGetErrorString(err1));
+    }
     MHAFlashDecodeKernel<<<grid_dec, block_dec, max_shmem_size>>>(d_out, d_q, d_k, d_v, d_kv_indices);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    err1 = cudaGetLastError();
+    if (err1 != cudaSuccess) {
+        printf("baseline 1 MHAFlashDecodeKernel error: %s\n", cudaGetErrorString(err1));
+    }
+    
     // run baseline 2
     CUDA_CHECK(cudaMemset(d_out_2, 0, sizeof(half) * (size_t)HEAD_NUM * HEAD_DIM));
     topk_attn_fused_kernel<<<grid_fused, block_fused, fused_shmem_bytes>>>(d_out_2, d_k, d_v, d_q, d_centers);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    cudaError_t err2 = cudaGetLastError();
+    if (err2 != cudaSuccess) {
+        printf("baseline 2 error: %s\n", cudaGetErrorString(err2));
+    }
+    
     // run baseline 3
     CUDA_CHECK(cudaMemset(d_out_3, 0, sizeof(half) * (size_t)HEAD_NUM * HEAD_DIM));
     topk_attn_block_specialization_kernel<<<grid_bs, block_bs, bs_shmem_bytes>>>(d_out_3, d_k, d_v, d_q, d_centers);
     CUDA_CHECK(cudaDeviceSynchronize());
+    cudaError_t err3 = cudaGetLastError();
+    if (err3 != cudaSuccess) {
+        printf("baseline 3 error: %s\n", cudaGetErrorString(err3));
+    }
 
     CUDA_CHECK(cudaMemcpy(h_out.data(), d_out, sizeof(half) * (size_t)HEAD_NUM * HEAD_DIM, cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaMemcpy(h_out_fused.data(), d_out_2, sizeof(half) * (size_t)HEAD_NUM * HEAD_DIM, cudaMemcpyDeviceToHost));
@@ -1770,18 +1814,28 @@ int main(int argc, char** argv) {
     printf("\n");
 
     float max_diff = 0.0f;
+    int max_diff_idx = 0;
     for (size_t i = 0; i < h_out.size(); ++i) {
         float diff = fabsf(__half2float(h_out[i]) - __half2float(h_out_fused[i]));
-        if (diff > max_diff) max_diff = diff;
+        if (diff > max_diff) {
+            max_diff = diff;
+            max_diff_idx = i;
+        }
     }
-    printf("max abs diff between baseline_1&2 outputs: %.6f\n", max_diff);
+    printf("max abs diff between baseline_1&2 outputs: %.6f at index %d (bl1=%.6f, bl2=%.6f)\n", 
+           max_diff, max_diff_idx, __half2float(h_out[max_diff_idx]), __half2float(h_out_fused[max_diff_idx]));
+    
     max_diff = 0.0f;
+    max_diff_idx = 0;
     for (size_t i = 0; i < h_out.size(); ++i) {
         float diff = fabsf(__half2float(h_out[i]) - __half2float(h_out_bs[i]));
-        if (diff > max_diff) max_diff = diff;
+        if (diff > max_diff) {
+            max_diff = diff;
+            max_diff_idx = i;
+        }
     }
-
-    printf("max abs diff between baseline_1&3 outputs: %.6f\n", max_diff);
+    printf("max abs diff between baseline_1&3 outputs: %.6f at index %d (bl1=%.6f, bl3=%.6f)\n", 
+           max_diff, max_diff_idx, __half2float(h_out[max_diff_idx]), __half2float(h_out_bs[max_diff_idx]));
 #endif
 
 	// Cleanup
