@@ -1,0 +1,1 @@
+run `make s3` to run all the baselines.
