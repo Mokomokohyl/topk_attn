@@ -1,4 +1,7 @@
-// nvcc -O3 -std=c++17 -arch=sm_120a -o baseline_2 baseline_2.cu && ./baseline_2
+// Build & run (from repo root):
+//   make s2
+// Or manual:
+//   nvcc -O3 -std=c++17 -arch=sm_120a -o bin/baseline_2 baselines/original/cuda/baseline_2.cu && ./bin/baseline_2
 
 #include <iostream>
 #include <cuda.h>

@@ -1,6 +1,37 @@
-baseline_1
-baseline_2
-baseline_3
 gemv_topk
 flash_decoding
 gemv_profile_split
+
+# Build outputs
+bin/
+build/
+
+# Compiled objects / CUDA artifacts
+*.o
+*.obj
+*.a
+*.so
+*.dylib
+*.dll
+*.ptx
+*.cubin
+*.fatbin
+
+# Profiler and traces
+*.nvvp
+*.nsys-rep
+*.qdrep
+*.sqlite
+
+# Python caches
+__pycache__/
+*.pyc
+*.pyo
+
+# Editor/OS junk
+.vscode/
+.DS_Store
+*.swp
+*.swo
+*.tmp
+*.log
