@@ -1,5 +1,10 @@
-// nvcc -O3 -std=c++17 -arch=sm_120a -o baselines baselines.cu && ./baselines && rm ./baselines
-// nvcc -O3 -std=c++17 -arch=sm_120a -o baselines baselines.cu
+/* 
+Correctness check:
+nvcc -O3 -std=c++17 -arch=sm_120a -DDEBUG -o baselines_dbg baselines.cu && ./baselines_dbg && rm ./baselines_dbg
+
+Latency test:
+nvcc -O3 -std=c++17 -arch=sm_120a -o baselines baselines.cu && ./baselines && rm ./baselines
+*/
 
 #include <iostream>
 #include <cuda.h>
@@ -22,9 +27,6 @@
 using barrier = cuda::barrier<cuda::thread_scope_block>;
 namespace cde = cuda::device::experimental;
 namespace cg = cooperative_groups;
-
-// DEBUG macro
-#define DEBUG
 
 #define CUDA_CHECK(call) do { \
 	cudaError_t err = (call); \
