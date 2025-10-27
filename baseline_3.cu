@@ -1767,6 +1767,24 @@ int main(int argc, char** argv) {
     printf("baseline 3 latency: %.3f us\n", (ms_bs / iters_bs) * 1000.0f);
 #endif
 
+    // ---- Baseline 3: kernel launch efficiency (theoretical occupancy) ----
+    {
+        cudaFuncAttributes attr{};
+        cudaFuncGetAttributes(&attr, topk_attn_block_specialization_kernel);
+        int numBlocksPerSm = 0;
+        cudaError_t occErr = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+            &numBlocksPerSm,
+            topk_attn_block_specialization_kernel,
+            block_bs.x,
+            bs_shmem_bytes);
+        int maxThreadsPerSm = prop.maxThreadsPerMultiProcessor;
+        int maxWarpsPerSm = maxThreadsPerSm / 32;
+        int activeWarps = numBlocksPerSm * (block_bs.x / 32);
+        float occPct = maxWarpsPerSm > 0 ? (100.0f * (float)activeWarps / (float)maxWarpsPerSm) : 0.0f;
+     printf("[Baseline 3] regs/thread=%d, static_shmem=%zu B, dyn_shmem=%u B, blocks/SM=%d, theoretical_occupancy=%.1f%% (err=%d)\n",
+         attr.numRegs, (size_t)attr.sharedSizeBytes, bs_shmem_bytes, numBlocksPerSm, occPct, (int)occErr);
+    }
+
     // ---- Correctness check ----
 #ifdef DEBUG
     // run baseline 1
