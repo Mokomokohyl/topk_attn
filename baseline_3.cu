@@ -24,6 +24,21 @@ namespace cg = cooperative_groups;
 // DEBUG macro
 // #define DEBUG
 
+#ifdef AB_DEBUG_PRINT
+#define DEBUG
+#endif
+
+// ---- Ablation switches (default ON for optimized, set -D to override) ----
+#ifndef AB_Q_PRELOAD
+#define AB_Q_PRELOAD 1  // Load q into registers before flash-decoding compute
+#endif
+#ifndef AB_FLASH_KV_SHMEM_SMALL
+#define AB_FLASH_KV_SHMEM_SMALL 1  // Use 640-entry kv_indices for flash-decoding blocks
+#endif
+#ifndef AB_LOCK_INIT_ONLY_FLASH
+#define AB_LOCK_INIT_ONLY_FLASH 1  // Only flash blocks init lock=0
+#endif
+
 #define CUDA_CHECK(call) do { \
 	cudaError_t err = (call); \
 	if (err != cudaSuccess) { \
@@ -1083,14 +1098,22 @@ __global__ void __cluster_dims__(CLUSTER_SIZE, 1, 1) topk_attn_block_specializat
     // Init shared memory
     // Flash-decoding blocks only need KV_DIM_PER_BLOCK_BS indices
     // Gemv-topk block needs full TOPC * TOPK_PER_CLUSTER space
+#if AB_FLASH_KV_SHMEM_SMALL
     __shared__ __align__(16) int kv_indices[KV_DIM_PER_BLOCK_BS];
+#else
+    __shared__ __align__(16) int kv_indices[TOPC * TOPK_PER_CLUSTER];
+#endif
     __shared__ __align__(16) int lock;
     volatile int* lock_ptr = &lock;
     int *dst_shmem;
     
+#if AB_LOCK_INIT_ONLY_FLASH
     if (cluster_block_id != CLUSTER_SIZE - 1) {
         lock = 0;  // Flash-decoding blocks initialize lock to 0
     }
+#else
+    lock = 0;
+#endif
 
     extern __shared__ uint8_t shmem_base[];
 
@@ -1361,7 +1384,9 @@ __global__ void __cluster_dims__(CLUSTER_SIZE, 1, 1) topk_attn_block_specializat
     for(int i = 0; i < NUM_PER_THREAD; i++)
         reg_reduce[i] = 0.0f;
     // CRITICAL FIX: Load q into reg_input for flash-decoding computation!
+#if AB_Q_PRELOAD
     *(uint4*)(&reg_input[0]) = *(uint4*)(&q[cluster_head_idx + input_idx]);
+#endif
     block.sync();
 
     // Preload kv_cache - flash-decoding blocks use their local kv_indices directly (no offset needed)
