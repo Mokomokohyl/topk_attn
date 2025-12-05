@@ -112,8 +112,10 @@ def run_test(topk=128):
     
     # Run Kernel
     if topk == 128:
+        print("Running DSM Kernel...")
         ra_ops.retrieval_attention_128(q, k, v, output_kernel)
     elif topk == 256:
+        print("Running DSM Kernel...")
         ra_ops.retrieval_attention_256(q, k, v, output_kernel)
         
     # Run Reference
@@ -127,17 +129,35 @@ def run_test(topk=128):
     max_diff = diff.max().item()
     mean_diff = diff.mean().item()
     
-    print(f"Max diff: {max_diff}")
-    print(f"Mean diff: {mean_diff}")
-    
-    # Check first few values
-    print("Kernel (head 0, first 5):", output_kernel_s[0, :5])
-    print("Ref    (head 0, first 5):", output_ref[0, :5])
+    print(f"DSM Kernel - Max diff: {max_diff}")
+    print(f"DSM Kernel - Mean diff: {mean_diff}")
     
     if max_diff < 1e-2:
-        print("PASSED")
+        print("DSM Kernel: PASSED")
     else:
-        print("FAILED")
+        print("DSM Kernel: FAILED")
+
+    # Run Global Kernel
+    output_kernel_global = torch.zeros(1, NUM_HEADS, HEAD_DIM, device=device, dtype=torch.float16)
+    if topk == 128:
+        print("Running Global Kernel...")
+        ra_ops.retrieval_attention_global_128(q, k, v, output_kernel_global)
+    elif topk == 256:
+        print("Running Global Kernel...")
+        ra_ops.retrieval_attention_global_256(q, k, v, output_kernel_global)
+
+    output_kernel_global_s = output_kernel_global.squeeze(0)
+    diff_global = (output_kernel_global_s - output_ref).abs()
+    max_diff_global = diff_global.max().item()
+    mean_diff_global = diff_global.mean().item()
+
+    print(f"Global Kernel - Max diff: {max_diff_global}")
+    print(f"Global Kernel - Mean diff: {mean_diff_global}")
+
+    if max_diff_global < 1e-2:
+        print("Global Kernel: PASSED")
+    else:
+        print("Global Kernel: FAILED")
 
 if __name__ == "__main__":
     run_test(128)
