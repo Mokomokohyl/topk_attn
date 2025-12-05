@@ -844,6 +844,15 @@ void run_retrieval_attention_global(
 
 #ifdef TORCH_EXTENSION_NAME
 // Wrapper for PyTorch extension
+void launch_retrieval_attention_32(
+    const half* query,
+    const half* key_cache,
+    const half* value_cache,
+    half* output
+) {
+    run_retrieval_attention<32>(query, key_cache, value_cache, output, 1);
+}
+
 void launch_retrieval_attention_128(
     const half* query,
     const half* key_cache,
@@ -860,6 +869,15 @@ void launch_retrieval_attention_256(
     half* output
 ) {
     run_retrieval_attention<256>(query, key_cache, value_cache, output, 1);
+}
+
+void launch_retrieval_attention_global_32(
+    const half* query,
+    const half* key_cache,
+    const half* value_cache,
+    half* output
+) {
+    run_retrieval_attention_global<32>(query, key_cache, value_cache, output, 1);
 }
 
 void launch_retrieval_attention_global_128(
@@ -986,6 +1004,12 @@ int main() {
     printf("\n=== Running Baseline Attention ===\n");
     run_baseline_attention(d_query, d_key_cache, d_value_cache, d_output);
     
+    printf("\n=== Running Retrieval Attention (TOPK=32 per block) ===\n");
+    run_retrieval_attention<32>(d_query, d_key_cache, d_value_cache, d_output);
+    
+    printf("\n=== Running Retrieval Attention (Global Memory, TOPK=32 per block) ===\n");
+    run_retrieval_attention_global<32>(d_query, d_key_cache, d_value_cache, d_output);
+
     printf("\n=== Running Retrieval Attention (TOPK=128 per block) ===\n");
     run_retrieval_attention<128>(d_query, d_key_cache, d_value_cache, d_output);
     

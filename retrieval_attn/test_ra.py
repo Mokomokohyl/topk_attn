@@ -111,7 +111,10 @@ def run_test(topk=128):
     output_kernel = torch.zeros(1, NUM_HEADS, HEAD_DIM, device=device, dtype=torch.float16)
     
     # Run Kernel
-    if topk == 128:
+    if topk == 32:
+        print("Running DSM Kernel...")
+        ra_ops.retrieval_attention_32(q, k, v, output_kernel)
+    elif topk == 128:
         print("Running DSM Kernel...")
         ra_ops.retrieval_attention_128(q, k, v, output_kernel)
     elif topk == 256:
@@ -139,7 +142,10 @@ def run_test(topk=128):
 
     # Run Global Kernel
     output_kernel_global = torch.zeros(1, NUM_HEADS, HEAD_DIM, device=device, dtype=torch.float16)
-    if topk == 128:
+    if topk == 32:
+        print("Running Global Kernel...")
+        ra_ops.retrieval_attention_global_32(q, k, v, output_kernel_global)
+    elif topk == 128:
         print("Running Global Kernel...")
         ra_ops.retrieval_attention_global_128(q, k, v, output_kernel_global)
     elif topk == 256:
@@ -160,5 +166,6 @@ def run_test(topk=128):
         print("Global Kernel: FAILED")
 
 if __name__ == "__main__":
+    run_test(32)
     run_test(128)
     run_test(256)
