@@ -120,6 +120,12 @@ def run_test(topk=128):
     elif topk == 256:
         print("Running DSM Kernel...")
         ra_ops.retrieval_attention_256(q, k, v, output_kernel)
+    elif topk == 512:
+        print("Running DSM Kernel...")
+        ra_ops.retrieval_attention_512(q, k, v, output_kernel)
+    elif topk == 1024:
+        print("Running DSM Kernel...")
+        ra_ops.retrieval_attention_1024(q, k, v, output_kernel)
         
     # Run Reference
     output_ref = reference_retrieval_attention(q, k, v, topk)
@@ -151,6 +157,12 @@ def run_test(topk=128):
     elif topk == 256:
         print("Running Global Kernel...")
         ra_ops.retrieval_attention_global_256(q, k, v, output_kernel_global)
+    elif topk == 512:
+        print("Running Global Kernel...")
+        ra_ops.retrieval_attention_global_512(q, k, v, output_kernel_global)
+    elif topk == 1024:
+        print("Running Global Kernel...")
+        ra_ops.retrieval_attention_global_1024(q, k, v, output_kernel_global)
 
     output_kernel_global_s = output_kernel_global.squeeze(0)
     diff_global = (output_kernel_global_s - output_ref).abs()
@@ -169,3 +181,5 @@ if __name__ == "__main__":
     run_test(32)
     run_test(128)
     run_test(256)
+    run_test(512)
+    run_test(1024)

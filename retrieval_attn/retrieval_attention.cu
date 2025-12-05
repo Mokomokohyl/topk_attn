@@ -871,6 +871,24 @@ void launch_retrieval_attention_256(
     run_retrieval_attention<256>(query, key_cache, value_cache, output, 1);
 }
 
+void launch_retrieval_attention_512(
+    const half* query,
+    const half* key_cache,
+    const half* value_cache,
+    half* output
+) {
+    run_retrieval_attention<512>(query, key_cache, value_cache, output, 1);
+}
+
+void launch_retrieval_attention_1024(
+    const half* query,
+    const half* key_cache,
+    const half* value_cache,
+    half* output
+) {
+    run_retrieval_attention<1024>(query, key_cache, value_cache, output, 1);
+}
+
 void launch_retrieval_attention_global_32(
     const half* query,
     const half* key_cache,
@@ -896,6 +914,24 @@ void launch_retrieval_attention_global_256(
     half* output
 ) {
     run_retrieval_attention_global<256>(query, key_cache, value_cache, output, 1);
+}
+
+void launch_retrieval_attention_global_512(
+    const half* query,
+    const half* key_cache,
+    const half* value_cache,
+    half* output
+) {
+    run_retrieval_attention_global<512>(query, key_cache, value_cache, output, 1);
+}
+
+void launch_retrieval_attention_global_1024(
+    const half* query,
+    const half* key_cache,
+    const half* value_cache,
+    half* output
+) {
+    run_retrieval_attention_global<1024>(query, key_cache, value_cache, output, 1);
 }
 #else
 
@@ -1021,6 +1057,18 @@ int main() {
 
     printf("\n=== Running Retrieval Attention (Global Memory, TOPK=256 per block) ===\n");
     run_retrieval_attention_global<256>(d_query, d_key_cache, d_value_cache, d_output);
+
+    printf("\n=== Running Retrieval Attention (TOPK=512 per block) ===\n");
+    run_retrieval_attention<512>(d_query, d_key_cache, d_value_cache, d_output);
+
+    printf("\n=== Running Retrieval Attention (Global Memory, TOPK=512 per block) ===\n");
+    run_retrieval_attention_global<512>(d_query, d_key_cache, d_value_cache, d_output);
+
+    printf("\n=== Running Retrieval Attention (TOPK=1024 per block) ===\n");
+    run_retrieval_attention<1024>(d_query, d_key_cache, d_value_cache, d_output);
+
+    printf("\n=== Running Retrieval Attention (Global Memory, TOPK=1024 per block) ===\n");
+    run_retrieval_attention_global<1024>(d_query, d_key_cache, d_value_cache, d_output);
     
     // Copy result back
     CUDA_CHECK(cudaMemcpy(h_output, d_output, query_size, cudaMemcpyDeviceToHost));
