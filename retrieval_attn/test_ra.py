@@ -260,6 +260,34 @@ def run_test(topk=128, batch_size=4):
     else:
         print("Pipelined Kernel: FAILED")
 
+    # Run Two Kernels (TopK + Reduce)
+    output_kernel_two = torch.zeros(batch_size, NUM_HEADS, HEAD_DIM, device=device, dtype=torch.float16)
+    print("Running Two Kernels...")
+    with CaptureOutput() as capturer:
+        if topk == 32:
+            ra_ops.retrieval_attention_two_kernels_32(q, k, v, output_kernel_two)
+        elif topk == 128:
+            ra_ops.retrieval_attention_two_kernels_128(q, k, v, output_kernel_two)
+        elif topk == 256:
+            ra_ops.retrieval_attention_two_kernels_256(q, k, v, output_kernel_two)
+        elif topk == 512:
+            ra_ops.retrieval_attention_two_kernels_512(q, k, v, output_kernel_two)
+        elif topk == 1024:
+            ra_ops.retrieval_attention_two_kernels_1024(q, k, v, output_kernel_two)
+    parse_and_record(capturer.captured, topk, "TwoKernels")
+
+    diff_two = (output_kernel_two - output_ref).abs()
+    max_diff_two = diff_two.max().item()
+    mean_diff_two = diff_two.mean().item()
+
+    print(f"Two Kernels - Max diff: {max_diff_two}")
+    print(f"Two Kernels - Mean diff: {mean_diff_two}")
+
+    if max_diff_two < 1e-2:
+        print("Two Kernels: PASSED")
+    else:
+        print("Two Kernels: FAILED")
+
 if __name__ == "__main__":
     run_test(32, batch_size=4)
     run_test(128, batch_size=4)

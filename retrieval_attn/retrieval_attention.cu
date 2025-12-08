@@ -149,13 +149,13 @@ __global__ void baseline_attention_kernel(
     __syncthreads();
     
     // Compute P @ V
-    for (int d = tid; d < HEAD_DIM; d += block_size) {
+    for (int d = tid, idx = 0; d < HEAD_DIM; d += block_size, idx++) {
         half acc = __float2half(0.0f);
         for (int seq_idx = 0; seq_idx < SEQ_LEN; seq_idx++) {
             const half* v = v_base + seq_idx * NUM_HEADS * HEAD_DIM;
             acc = __hadd(acc, __hmul(s_scores[seq_idx], v[d]));
         }
-        s_output[d] = acc;
+        s_output[idx] = acc;
     }
     __syncthreads();
     
@@ -561,8 +561,6 @@ __global__ void retrieval_attention_global_kernel(
             global_scores[global_offset + i] = __float2half(s_scores[i]);
             global_indices[global_offset + i] = key_start + s_indices[i];
         }
-        // Ensure global write is visible
-        __threadfence();
     }
     
     // Sync cluster to ensure QK blocks have written to global memory
@@ -897,6 +895,277 @@ __global__ void retrieval_attention_pipelined_kernel(
 }
 
 // ============================================================================
+// Standalone TopK Kernel (Step 1 of 2)
+// ============================================================================
+template<int TOPK_PER_BLOCK>
+__global__ void retrieval_topk_kernel(
+    const half* __restrict__ query,      // [BATCH_SIZE, NUM_HEADS, HEAD_DIM]
+    const half* __restrict__ key_cache,  // [SEQ_LEN, NUM_HEADS, HEAD_DIM]
+    half* __restrict__ global_scores,    // [BATCH_SIZE, NUM_HEADS, TOTAL_TOPK]
+    int* __restrict__ global_indices     // [BATCH_SIZE, NUM_HEADS, TOTAL_TOPK]
+) {
+    using Config = KernelConfig<TOPK_PER_BLOCK>;
+    constexpr int TOPK = Config::TOPK;
+    constexpr int TOTAL_TOPK = Config::TOTAL_TOPK;
+    constexpr int KEYS_PER_BLOCK = Config::KEYS_PER_QK_BLOCK;
+    constexpr int BLOCK_SIZE = Config::BLOCK_SIZE;
+    constexpr int ITEMS_PER_THREAD = Config::ITEMS_PER_THREAD;
+    
+    // Grid: (BATCH * NUM_HEADS, QK_BLOCKS_PER_CLUSTER)
+    int batch_head_idx = blockIdx.x;
+    int chunk_idx = blockIdx.y; // 0 to QK_BLOCKS_PER_CLUSTER-1
+    
+    int batch_idx = batch_head_idx / NUM_HEADS;
+    int head_idx = batch_head_idx % NUM_HEADS;
+    int tid = threadIdx.x;
+    
+    // Pointers for this head
+    const half* q = query + (batch_idx * NUM_HEADS + head_idx) * HEAD_DIM;
+    const half* k_base = key_cache + head_idx * HEAD_DIM;
+    
+    // Shared memory for sorting
+    // Use float for scores to support CUB sort
+    extern __shared__ float s_scores[]; // Size: KEYS_PER_BLOCK * sizeof(float)
+    int* s_indices = (int*)&s_scores[KEYS_PER_BLOCK];
+    
+    // CUB Sort Storage
+    using BlockSort = cub::BlockRadixSort<float, BLOCK_SIZE, ITEMS_PER_THREAD, int>;
+    __shared__ typename BlockSort::TempStorage sort_storage;
+    
+    // Compute scores for this block's key range
+    int key_start = chunk_idx * KEYS_PER_BLOCK;
+    
+    // Thread-local storage for sorting
+    float thread_keys[ITEMS_PER_THREAD];
+    int thread_values[ITEMS_PER_THREAD];
+    
+    for (int item = 0; item < ITEMS_PER_THREAD; ++item) {
+        int local_idx = tid * ITEMS_PER_THREAD + item;
+        int global_key_idx = key_start + local_idx;
+        const half* k = k_base + global_key_idx * NUM_HEADS * HEAD_DIM;
+        
+        float score = 0.0f;
+        #pragma unroll 8
+        for (int d = 0; d < HEAD_DIM; d++) {
+            score += __half2float(q[d]) * __half2float(k[d]);
+        }
+        thread_keys[item] = score;
+        thread_values[item] = local_idx;
+    }
+    
+    // Sort
+    BlockSort(sort_storage).SortDescending(thread_keys, thread_values);
+    
+    // Write sorted results to shared memory (only need top K)
+    __syncthreads();
+    for (int item = 0; item < ITEMS_PER_THREAD; ++item) {
+        int rank = tid * ITEMS_PER_THREAD + item;
+        if (rank < TOPK) {
+            s_scores[rank] = thread_keys[item];
+            s_indices[rank] = thread_values[item];
+        }
+    }
+    __syncthreads();
+    
+    // Write to Global Memory
+    int global_offset = batch_head_idx * TOTAL_TOPK + chunk_idx * TOPK;
+    for (int i = tid; i < TOPK; i += BLOCK_SIZE) {
+        global_scores[global_offset + i] = __float2half(s_scores[i]);
+        global_indices[global_offset + i] = key_start + s_indices[i];
+    }
+}
+
+// ============================================================================
+// Standalone Reduce Kernel (Step 2 of 2)
+// ============================================================================
+template<int TOPK_PER_BLOCK>
+__global__ void retrieval_reduce_kernel(
+    const half* __restrict__ value_cache,// [SEQ_LEN, NUM_HEADS, HEAD_DIM]
+    half* __restrict__ output,           // [BATCH_SIZE, NUM_HEADS, HEAD_DIM]
+    const half* __restrict__ global_scores,    // [BATCH_SIZE, NUM_HEADS, TOTAL_TOPK]
+    const int* __restrict__ global_indices     // [BATCH_SIZE, NUM_HEADS, TOTAL_TOPK]
+) {
+    using Config = KernelConfig<TOPK_PER_BLOCK>;
+    constexpr int TOTAL_TOPK = Config::TOTAL_TOPK;
+    constexpr int BLOCK_SIZE = Config::BLOCK_SIZE;
+    
+    int batch_head_idx = blockIdx.x;
+    int batch_idx = batch_head_idx / NUM_HEADS;
+    int head_idx = batch_head_idx % NUM_HEADS;
+    int tid = threadIdx.x;
+    int block_size = blockDim.x;
+    
+    const half* v_base = value_cache + head_idx * HEAD_DIM;
+    
+    // Shared memory
+    extern __shared__ half shared_mem[];
+    half* s_all_scores = shared_mem;
+    int* s_all_indices = (int*)&s_all_scores[TOTAL_TOPK];
+    half* s_probs = (half*)&s_all_indices[TOTAL_TOPK];
+    half* s_output = &s_probs[TOTAL_TOPK];
+    
+    // Read from Global Memory
+    int global_offset = batch_head_idx * TOTAL_TOPK;
+    for (int i = tid; i < TOTAL_TOPK; i += block_size) {
+        s_all_scores[i] = global_scores[global_offset + i];
+        s_all_indices[i] = global_indices[global_offset + i];
+    }
+    __syncthreads();
+    
+    // Simple softmax
+    half sum = __float2half(0.0f);
+    for (int i = tid; i < TOTAL_TOPK; i += block_size) {
+        half exp_val = hexp(s_all_scores[i]);
+        s_probs[i] = exp_val;
+        sum = __hadd(sum, exp_val);
+    }
+    
+    // Reduce sum across threads
+    __syncthreads();
+    __shared__ half s_sum_reduce[32];
+    
+    int warp_id = tid / 32;
+    int lane_id = tid % 32;
+    
+    // Warp-level reduction
+    for (int offset = 16; offset > 0; offset /= 2) {
+        sum = __hadd(sum, __shfl_down_sync(0xffffffff, sum, offset));
+    }
+    
+    if (lane_id == 0) {
+        s_sum_reduce[warp_id] = sum;
+    }
+    __syncthreads();
+    
+    // Final reduction
+    if (tid == 0) {
+        sum = __float2half(0.0f);
+        int num_warps = (block_size + 31) / 32;
+        for (int i = 0; i < num_warps; i++) {
+            sum = __hadd(sum, s_sum_reduce[i]);
+        }
+        s_sum_reduce[0] = sum;
+    }
+    __syncthreads();
+    sum = s_sum_reduce[0];
+    
+    // Normalize
+    for (int i = tid; i < TOTAL_TOPK; i += block_size) {
+        s_probs[i] = __hdiv(s_probs[i], sum);
+    }
+    __syncthreads();
+    
+    // Compute P @ V
+    for (int d = tid; d < HEAD_DIM; d += block_size) {
+        half acc = __float2half(0.0f);
+        for (int i = 0; i < TOTAL_TOPK; i++) {
+            int key_idx = s_all_indices[i];
+            if (key_idx >= 0 && key_idx < SEQ_LEN) {
+                const half* v = v_base + key_idx * NUM_HEADS * HEAD_DIM;
+                acc = __hadd(acc, __hmul(s_probs[i], v[d]));
+            }
+        }
+        s_output[d] = acc;
+    }
+    __syncthreads();
+    
+    // Write output
+    half* out = output + (batch_idx * NUM_HEADS + head_idx) * HEAD_DIM;
+    for (int d = tid; d < HEAD_DIM; d += block_size) {
+        out[d] = s_output[d];
+    }
+}
+
+template<int TOPK_PER_BLOCK>
+void run_retrieval_attention_two_kernels(
+    const half* d_query,
+    const half* d_key_cache,
+    const half* d_value_cache,
+    half* d_output,
+    int batch_size = 1,
+    int num_iterations = 100
+) {
+    using Config = KernelConfig<TOPK_PER_BLOCK>;
+    constexpr int BLOCK_SIZE = Config::BLOCK_SIZE;
+    constexpr int TOPK = Config::TOPK;
+    constexpr int TOTAL_TOPK = Config::TOTAL_TOPK;
+    constexpr int KEYS_PER_BLOCK = Config::KEYS_PER_QK_BLOCK;
+    
+    // Allocate temporary global memory
+    half* d_global_scores;
+    int* d_global_indices;
+    size_t scores_size = batch_size * NUM_HEADS * TOTAL_TOPK * sizeof(half);
+    size_t indices_size = batch_size * NUM_HEADS * TOTAL_TOPK * sizeof(int);
+    
+    CUDA_CHECK(cudaMalloc(&d_global_scores, scores_size));
+    CUDA_CHECK(cudaMalloc(&d_global_indices, indices_size));
+    
+    // Shared memory sizes
+    // TopK Kernel: scores + indices + sort storage
+    using BlockSort = cub::BlockRadixSort<float, BLOCK_SIZE, Config::ITEMS_PER_THREAD, int>;
+    size_t topk_shared_size = KEYS_PER_BLOCK * sizeof(float) + 
+                              KEYS_PER_BLOCK * sizeof(int) + 
+                              sizeof(typename BlockSort::TempStorage);
+                              
+    // Reduce Kernel: all_scores + all_indices + probs + output + reduction
+    size_t reduce_shared_size = TOTAL_TOPK * sizeof(half) + 
+                                TOTAL_TOPK * sizeof(int) + 
+                                TOTAL_TOPK * sizeof(half) + 
+                                HEAD_DIM * sizeof(half) + 
+                                32 * sizeof(half);
+    
+    printf("Retrieval Attention Two-Kernels Config: TOPK=%d, TOTAL_TOPK=%d\n", TOPK, TOTAL_TOPK);
+    
+    // Grids
+    dim3 grid_topk(batch_size * NUM_HEADS, QK_BLOCKS_PER_CLUSTER);
+    dim3 block_topk(BLOCK_SIZE);
+    
+    dim3 grid_reduce(batch_size * NUM_HEADS);
+    dim3 block_reduce(BLOCK_SIZE);
+    
+    // Warmup
+    for (int i = 0; i < 10; i++) {
+        retrieval_topk_kernel<TOPK_PER_BLOCK><<<grid_topk, block_topk, topk_shared_size>>>(
+            d_query, d_key_cache, d_global_scores, d_global_indices
+        );
+        retrieval_reduce_kernel<TOPK_PER_BLOCK><<<grid_reduce, block_reduce, reduce_shared_size>>>(
+            d_value_cache, d_output, d_global_scores, d_global_indices
+        );
+    }
+    CUDA_CHECK(cudaDeviceSynchronize());
+    
+    // Benchmark
+    cudaEvent_t start, stop;
+    CUDA_CHECK(cudaEventCreate(&start));
+    CUDA_CHECK(cudaEventCreate(&stop));
+    
+    CUDA_CHECK(cudaEventRecord(start));
+    for (int i = 0; i < num_iterations; i++) {
+        retrieval_topk_kernel<TOPK_PER_BLOCK><<<grid_topk, block_topk, topk_shared_size>>>(
+            d_query, d_key_cache, d_global_scores, d_global_indices
+        );
+        retrieval_reduce_kernel<TOPK_PER_BLOCK><<<grid_reduce, block_reduce, reduce_shared_size>>>(
+            d_value_cache, d_output, d_global_scores, d_global_indices
+        );
+    }
+    CUDA_CHECK(cudaEventRecord(stop));
+    CUDA_CHECK(cudaEventSynchronize(stop));
+    
+    float milliseconds = 0;
+    CUDA_CHECK(cudaEventElapsedTime(&milliseconds, start, stop));
+    
+    printf("Retrieval Attention (Two Kernels) - Avg time: %.3f ms, Throughput: %.2f iter/s\n",
+           milliseconds / num_iterations,
+           num_iterations * 1000.0f / milliseconds);
+    
+    CUDA_CHECK(cudaEventDestroy(start));
+    CUDA_CHECK(cudaEventDestroy(stop));
+    
+    CUDA_CHECK(cudaFree(d_global_scores));
+    CUDA_CHECK(cudaFree(d_global_indices));
+}
+
+// ============================================================================
 // Host Code
 // ============================================================================
 
@@ -1089,9 +1358,6 @@ void run_retrieval_attention_global(
     
     CUDA_CHECK(cudaEventDestroy(start));
     CUDA_CHECK(cudaEventDestroy(stop));
-    
-    CUDA_CHECK(cudaFree(d_global_scores));
-    CUDA_CHECK(cudaFree(d_global_indices));
 }
 
 template<int TOPK_PER_BLOCK>
@@ -1329,6 +1595,56 @@ void launch_retrieval_attention_pipelined_1024(
     int batch_size
 ) {
     run_retrieval_attention_pipelined<1024>(query, key_cache, value_cache, output, batch_size, 1);
+}
+
+void launch_retrieval_attention_two_kernels_32(
+    const half* query,
+    const half* key_cache,
+    const half* value_cache,
+    half* output,
+    int batch_size
+) {
+    run_retrieval_attention_two_kernels<32>(query, key_cache, value_cache, output, batch_size, 1);
+}
+
+void launch_retrieval_attention_two_kernels_128(
+    const half* query,
+    const half* key_cache,
+    const half* value_cache,
+    half* output,
+    int batch_size
+) {
+    run_retrieval_attention_two_kernels<128>(query, key_cache, value_cache, output, batch_size, 1);
+}
+
+void launch_retrieval_attention_two_kernels_256(
+    const half* query,
+    const half* key_cache,
+    const half* value_cache,
+    half* output,
+    int batch_size
+) {
+    run_retrieval_attention_two_kernels<256>(query, key_cache, value_cache, output, batch_size, 1);
+}
+
+void launch_retrieval_attention_two_kernels_512(
+    const half* query,
+    const half* key_cache,
+    const half* value_cache,
+    half* output,
+    int batch_size
+) {
+    run_retrieval_attention_two_kernels<512>(query, key_cache, value_cache, output, batch_size, 1);
+}
+
+void launch_retrieval_attention_two_kernels_1024(
+    const half* query,
+    const half* key_cache,
+    const half* value_cache,
+    half* output,
+    int batch_size
+) {
+    run_retrieval_attention_two_kernels<1024>(query, key_cache, value_cache, output, batch_size, 1);
 }
 #else
 
