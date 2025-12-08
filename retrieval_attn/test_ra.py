@@ -2,6 +2,9 @@ import torch
 import math
 from torch.utils.cpp_extension import load
 import os
+import sys
+import re
+import tempfile
 
 # Constants from the kernel
 NUM_HEADS = 32
@@ -9,6 +12,68 @@ HEAD_DIM = 128
 SEQ_LEN = 8192
 CLUSTER_SIZE = 5
 QK_BLOCKS_PER_CLUSTER = 4
+
+import ctypes
+
+# Global results list
+results = []
+
+class CaptureOutput:
+    def __init__(self):
+        self.captured = ""
+        self.stdout_fd = sys.stdout.fileno()
+        self.saved_stdout_fd = os.dup(self.stdout_fd)
+        self.temp_fd, self.temp_path = tempfile.mkstemp()
+
+    def __enter__(self):
+        sys.stdout.flush()
+        # Redirect stdout to the temp file
+        os.dup2(self.temp_fd, self.stdout_fd)
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        # Flush Python's stdout
+        sys.stdout.flush()
+        
+        # Flush C stdout to ensure data is written to file
+        try:
+            libc = ctypes.CDLL(None)
+            c_stdout = ctypes.c_void_p.in_dll(libc, 'stdout')
+            libc.fflush(c_stdout)
+        except Exception:
+            pass
+
+        # Restore stdout
+        os.dup2(self.saved_stdout_fd, self.stdout_fd)
+        os.close(self.saved_stdout_fd)
+        
+        # Close the temp file handle
+        os.close(self.temp_fd)
+        
+        # Read content
+        with open(self.temp_path, 'r') as f:
+            self.captured = f.read()
+            
+        # Clean up
+        os.remove(self.temp_path)
+        
+        # Print captured output to real stdout
+        print(self.captured, end='')
+
+def parse_and_record(output, topk, kernel_type):
+    # Look for lines like: "Retrieval Attention ... - Avg time: X ms, Throughput: Y iter/s"
+    # We use a flexible regex to catch different prefixes
+    match = re.search(r"Avg time:\s+([\d\.]+)\s+ms,\s+Throughput:\s+([\d\.]+)\s+iter/s", output)
+    if match:
+        avg_time = float(match.group(1))
+        throughput = float(match.group(2))
+        results.append({
+            "TopK": topk,
+            "Kernel": kernel_type,
+            "Avg Time (ms)": avg_time,
+            "Throughput (iter/s)": throughput
+        })
+
 
 # Load the extension
 print("Compiling and loading extension...")
@@ -107,21 +172,19 @@ def run_test(topk=128, batch_size=4):
     output_kernel = torch.zeros(batch_size, NUM_HEADS, HEAD_DIM, device=device, dtype=torch.float16)
     
     # Run Kernel
-    if topk == 32:
-        print("Running DSM Kernel...")
-        ra_ops.retrieval_attention_32(q, k, v, output_kernel)
-    elif topk == 128:
-        print("Running DSM Kernel...")
-        ra_ops.retrieval_attention_128(q, k, v, output_kernel)
-    elif topk == 256:
-        print("Running DSM Kernel...")
-        ra_ops.retrieval_attention_256(q, k, v, output_kernel)
-    elif topk == 512:
-        print("Running DSM Kernel...")
-        ra_ops.retrieval_attention_512(q, k, v, output_kernel)
-    elif topk == 1024:
-        print("Running DSM Kernel...")
-        ra_ops.retrieval_attention_1024(q, k, v, output_kernel)
+    print("Running DSM Kernel...")
+    with CaptureOutput() as capturer:
+        if topk == 32:
+            ra_ops.retrieval_attention_32(q, k, v, output_kernel)
+        elif topk == 128:
+            ra_ops.retrieval_attention_128(q, k, v, output_kernel)
+        elif topk == 256:
+            ra_ops.retrieval_attention_256(q, k, v, output_kernel)
+        elif topk == 512:
+            ra_ops.retrieval_attention_512(q, k, v, output_kernel)
+        elif topk == 1024:
+            ra_ops.retrieval_attention_1024(q, k, v, output_kernel)
+    parse_and_record(capturer.captured, topk, "DSM")
         
     # Run Reference
     output_ref = reference_retrieval_attention(q, k, v, topk)
@@ -143,21 +206,19 @@ def run_test(topk=128, batch_size=4):
 
     # Run Global Kernel
     output_kernel_global = torch.zeros(batch_size, NUM_HEADS, HEAD_DIM, device=device, dtype=torch.float16)
-    if topk == 32:
-        print("Running Global Kernel...")
-        ra_ops.retrieval_attention_global_32(q, k, v, output_kernel_global)
-    elif topk == 128:
-        print("Running Global Kernel...")
-        ra_ops.retrieval_attention_global_128(q, k, v, output_kernel_global)
-    elif topk == 256:
-        print("Running Global Kernel...")
-        ra_ops.retrieval_attention_global_256(q, k, v, output_kernel_global)
-    elif topk == 512:
-        print("Running Global Kernel...")
-        ra_ops.retrieval_attention_global_512(q, k, v, output_kernel_global)
-    elif topk == 1024:
-        print("Running Global Kernel...")
-        ra_ops.retrieval_attention_global_1024(q, k, v, output_kernel_global)
+    print("Running Global Kernel...")
+    with CaptureOutput() as capturer:
+        if topk == 32:
+            ra_ops.retrieval_attention_global_32(q, k, v, output_kernel_global)
+        elif topk == 128:
+            ra_ops.retrieval_attention_global_128(q, k, v, output_kernel_global)
+        elif topk == 256:
+            ra_ops.retrieval_attention_global_256(q, k, v, output_kernel_global)
+        elif topk == 512:
+            ra_ops.retrieval_attention_global_512(q, k, v, output_kernel_global)
+        elif topk == 1024:
+            ra_ops.retrieval_attention_global_1024(q, k, v, output_kernel_global)
+    parse_and_record(capturer.captured, topk, "Global")
 
     diff_global = (output_kernel_global - output_ref).abs()
     max_diff_global = diff_global.max().item()
@@ -173,21 +234,19 @@ def run_test(topk=128, batch_size=4):
 
     # Run Pipelined Kernel
     output_kernel_pipelined = torch.zeros(batch_size, NUM_HEADS, HEAD_DIM, device=device, dtype=torch.float16)
-    if topk == 32:
-        print("Running Pipelined Kernel...")
-        ra_ops.retrieval_attention_pipelined_32(q, k, v, output_kernel_pipelined)
-    elif topk == 128:
-        print("Running Pipelined Kernel...")
-        ra_ops.retrieval_attention_pipelined_128(q, k, v, output_kernel_pipelined)
-    elif topk == 256:
-        print("Running Pipelined Kernel...")
-        ra_ops.retrieval_attention_pipelined_256(q, k, v, output_kernel_pipelined)
-    elif topk == 512:
-        print("Running Pipelined Kernel...")
-        ra_ops.retrieval_attention_pipelined_512(q, k, v, output_kernel_pipelined)
-    elif topk == 1024:
-        print("Running Pipelined Kernel...")
-        ra_ops.retrieval_attention_pipelined_1024(q, k, v, output_kernel_pipelined)
+    print("Running Pipelined Kernel...")
+    with CaptureOutput() as capturer:
+        if topk == 32:
+            ra_ops.retrieval_attention_pipelined_32(q, k, v, output_kernel_pipelined)
+        elif topk == 128:
+            ra_ops.retrieval_attention_pipelined_128(q, k, v, output_kernel_pipelined)
+        elif topk == 256:
+            ra_ops.retrieval_attention_pipelined_256(q, k, v, output_kernel_pipelined)
+        elif topk == 512:
+            ra_ops.retrieval_attention_pipelined_512(q, k, v, output_kernel_pipelined)
+        elif topk == 1024:
+            ra_ops.retrieval_attention_pipelined_1024(q, k, v, output_kernel_pipelined)
+    parse_and_record(capturer.captured, topk, "Pipelined")
 
     diff_pipelined = (output_kernel_pipelined - output_ref).abs()
     max_diff_pipelined = diff_pipelined.max().item()
@@ -207,3 +266,10 @@ if __name__ == "__main__":
     run_test(256, batch_size=4)
     run_test(512, batch_size=4)
     run_test(1024, batch_size=4)
+
+    print("\nPerformance Results (Batch Size = 4):")
+    print(f"| {'TopK':<5} | {'Kernel Type':<10} | {'Avg Time (ms)':<15} | {'Throughput (iter/s)':<20} |")
+    print(f"|{'-'*7}|{'-'*12}|{'-'*17}|{'-'*22}|")
+    for res in results:
+        print(f"| {res['TopK']:<5} | {res['Kernel']:<10} | {res['Avg Time (ms)']:<15.3f} | {res['Throughput (iter/s)']:<20.2f} |")
+
