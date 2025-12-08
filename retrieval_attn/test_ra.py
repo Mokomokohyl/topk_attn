@@ -262,7 +262,7 @@ def run_test(topk=128, batch_size=4):
 
     # Run Two Kernels (TopK + Reduce)
     output_kernel_two = torch.zeros(batch_size, NUM_HEADS, HEAD_DIM, device=device, dtype=torch.float16)
-    print("Running Two Kernels...")
+    print("Running TopK+Reduce kernels...")
     with CaptureOutput() as capturer:
         if topk == 32:
             ra_ops.retrieval_attention_two_kernels_32(q, k, v, output_kernel_two)
@@ -280,13 +280,41 @@ def run_test(topk=128, batch_size=4):
     max_diff_two = diff_two.max().item()
     mean_diff_two = diff_two.mean().item()
 
-    print(f"Two Kernels - Max diff: {max_diff_two}")
-    print(f"Two Kernels - Mean diff: {mean_diff_two}")
+    print(f"TopK+Reduce kernels - Max diff: {max_diff_two}")
+    print(f"TopK+Reduce kernels - Mean diff: {mean_diff_two}")
 
     if max_diff_two < 1e-2:
         print("Two Kernels: PASSED")
     else:
         print("Two Kernels: FAILED")
+
+    # Run Gather+Baseline
+    output_kernel_gather = torch.zeros(batch_size, NUM_HEADS, HEAD_DIM, device=device, dtype=torch.float16)
+    print("Running TopK+Attn...")
+    with CaptureOutput() as capturer:
+        if topk == 32:
+            ra_ops.retrieval_attention_gather_baseline_32(q, k, v, output_kernel_gather)
+        elif topk == 128:
+            ra_ops.retrieval_attention_gather_baseline_128(q, k, v, output_kernel_gather)
+        elif topk == 256:
+            ra_ops.retrieval_attention_gather_baseline_256(q, k, v, output_kernel_gather)
+        elif topk == 512:
+            ra_ops.retrieval_attention_gather_baseline_512(q, k, v, output_kernel_gather)
+        elif topk == 1024:
+            ra_ops.retrieval_attention_gather_baseline_1024(q, k, v, output_kernel_gather)
+    parse_and_record(capturer.captured, topk, "TopK+Attn")
+
+    diff_gather = (output_kernel_gather - output_ref).abs()
+    max_diff_gather = diff_gather.max().item()
+    mean_diff_gather = diff_gather.mean().item()
+
+    print(f"TopK+Attn - Max diff: {max_diff_gather}")
+    print(f"TopK+Attn - Mean diff: {mean_diff_gather}")
+
+    if max_diff_gather < 1e-2:
+        print("TopK+Attn: PASSED")
+    else:
+        print("TopK+Attn: FAILED")
 
 if __name__ == "__main__":
     run_test(32, batch_size=4)

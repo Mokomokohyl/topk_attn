@@ -52,7 +52,8 @@ __global__ void baseline_attention_kernel(
     const half* __restrict__ query,      // [BATCH_SIZE, NUM_HEADS, HEAD_DIM]
     const half* __restrict__ key_cache,  // [SEQ_LEN, NUM_HEADS, HEAD_DIM]
     const half* __restrict__ value_cache,// [SEQ_LEN, NUM_HEADS, HEAD_DIM]
-    half* __restrict__ output            // [BATCH_SIZE, NUM_HEADS, HEAD_DIM]
+    half* __restrict__ output,           // [BATCH_SIZE, NUM_HEADS, HEAD_DIM]
+    int seq_len
 ) {
     int batch_idx = blockIdx.x / NUM_HEADS;
     int head_idx = blockIdx.x % NUM_HEADS;
@@ -62,7 +63,7 @@ __global__ void baseline_attention_kernel(
     // Shared memory for reduction
     extern __shared__ half shared_mem[];
     half* s_scores = shared_mem;
-    half* s_output = &shared_mem[SEQ_LEN];
+    half* s_output = &shared_mem[seq_len];
     __shared__ half s_reduce[256];
     
     const half* q = query + (batch_idx * NUM_HEADS + head_idx) * HEAD_DIM;
@@ -70,7 +71,7 @@ __global__ void baseline_attention_kernel(
     const half* v_base = value_cache + head_idx * HEAD_DIM;
     
     // Compute QK scores
-    for (int seq_idx = tid; seq_idx < SEQ_LEN; seq_idx += block_size) {
+    for (int seq_idx = tid; seq_idx < seq_len; seq_idx += block_size) {
         const half* k = k_base + seq_idx * NUM_HEADS * HEAD_DIM;
         half score = __float2half(0.0f);
         for (int d = 0; d < HEAD_DIM; d++) {
@@ -82,7 +83,7 @@ __global__ void baseline_attention_kernel(
     
     // Find max
     half max_score = __float2half(-65504.0f);
-    for (int i = tid; i < SEQ_LEN; i += block_size) {
+    for (int i = tid; i < seq_len; i += block_size) {
         max_score = __hmax(max_score, s_scores[i]);
     }
     
@@ -113,7 +114,7 @@ __global__ void baseline_attention_kernel(
     
     // Compute exp and sum
     half sum = __float2half(0.0f);
-    for (int i = tid; i < SEQ_LEN; i += block_size) {
+    for (int i = tid; i < seq_len; i += block_size) {
         half exp_val = hexp(__hsub(s_scores[i], max_score));
         s_scores[i] = exp_val;
         sum = __hadd(sum, exp_val);
@@ -143,19 +144,19 @@ __global__ void baseline_attention_kernel(
     sum = s_reduce[0];
     
     // Normalize
-    for (int i = tid; i < SEQ_LEN; i += block_size) {
+    for (int i = tid; i < seq_len; i += block_size) {
         s_scores[i] = __hdiv(s_scores[i], sum);
     }
     __syncthreads();
     
     // Compute P @ V
-    for (int d = tid, idx = 0; d < HEAD_DIM; d += block_size, idx++) {
+    for (int d = tid; d < HEAD_DIM; d += block_size) {
         half acc = __float2half(0.0f);
-        for (int seq_idx = 0; seq_idx < SEQ_LEN; seq_idx++) {
+        for (int seq_idx = 0; seq_idx < seq_len; seq_idx++) {
             const half* v = v_base + seq_idx * NUM_HEADS * HEAD_DIM;
             acc = __hadd(acc, __hmul(s_scores[seq_idx], v[d]));
         }
-        s_output[idx] = acc;
+        s_output[d] = acc;
     }
     __syncthreads();
     
@@ -1076,8 +1077,56 @@ __global__ void retrieval_reduce_kernel(
     }
 }
 
+// ============================================================================
+// Gather KV Kernel
+// ============================================================================
+__global__ void gather_kv_kernel(
+    const half* __restrict__ key_cache,   // [SEQ_LEN, NUM_HEADS, HEAD_DIM]
+    const half* __restrict__ value_cache, // [SEQ_LEN, NUM_HEADS, HEAD_DIM]
+    const int* __restrict__ indices,      // [BATCH_SIZE, NUM_HEADS, TOTAL_TOPK]
+    half* __restrict__ gathered_key,      // [BATCH_SIZE, TOTAL_TOPK, NUM_HEADS, HEAD_DIM]
+    half* __restrict__ gathered_value,    // [BATCH_SIZE, TOTAL_TOPK, NUM_HEADS, HEAD_DIM]
+    int total_topk
+) {
+    // Grid: (BATCH * NUM_HEADS, TOTAL_TOPK)
+    int batch_head_idx = blockIdx.x;
+    int topk_idx = blockIdx.y;
+    
+    int batch_idx = batch_head_idx / NUM_HEADS;
+    int head_idx = batch_head_idx % NUM_HEADS;
+    int tid = threadIdx.x; // Loop over HEAD_DIM
+    
+    if (topk_idx >= total_topk) return;
+    
+    // Read index
+    int global_idx_offset = batch_head_idx * total_topk + topk_idx;
+    int key_idx = indices[global_idx_offset];
+    
+    // Pointers
+    // Original: [SEQ_LEN, NUM_HEADS, HEAD_DIM]
+    // Stride: NUM_HEADS * HEAD_DIM
+    const half* k_src = key_cache + key_idx * NUM_HEADS * HEAD_DIM + head_idx * HEAD_DIM;
+    const half* v_src = value_cache + key_idx * NUM_HEADS * HEAD_DIM + head_idx * HEAD_DIM;
+    
+    // Gathered: [BATCH, TOTAL_TOPK, NUM_HEADS, HEAD_DIM]
+    // Stride for batch: TOTAL_TOPK * NUM_HEADS * HEAD_DIM
+    // Stride for topk: NUM_HEADS * HEAD_DIM
+    // Stride for head: HEAD_DIM
+    long long batch_offset = (long long)batch_idx * total_topk * NUM_HEADS * HEAD_DIM;
+    long long topk_offset = (long long)topk_idx * NUM_HEADS * HEAD_DIM;
+    long long head_offset = (long long)head_idx * HEAD_DIM;
+    
+    half* k_dst = gathered_key + batch_offset + topk_offset + head_offset;
+    half* v_dst = gathered_value + batch_offset + topk_offset + head_offset;
+    
+    for (int d = tid; d < HEAD_DIM; d += blockDim.x) {
+        k_dst[d] = k_src[d];
+        v_dst[d] = v_src[d];
+    }
+}
+
 template<int TOPK_PER_BLOCK>
-void run_retrieval_attention_two_kernels(
+void run_retrieval_attention_gather_baseline(
     const half* d_query,
     const half* d_key_cache,
     const half* d_value_cache,
@@ -1094,11 +1143,17 @@ void run_retrieval_attention_two_kernels(
     // Allocate temporary global memory
     half* d_global_scores;
     int* d_global_indices;
+    half* d_gathered_key;
+    half* d_gathered_value;
+    
     size_t scores_size = batch_size * NUM_HEADS * TOTAL_TOPK * sizeof(half);
     size_t indices_size = batch_size * NUM_HEADS * TOTAL_TOPK * sizeof(int);
+    size_t gathered_size = batch_size * TOTAL_TOPK * NUM_HEADS * HEAD_DIM * sizeof(half);
     
     CUDA_CHECK(cudaMalloc(&d_global_scores, scores_size));
     CUDA_CHECK(cudaMalloc(&d_global_indices, indices_size));
+    CUDA_CHECK(cudaMalloc(&d_gathered_key, gathered_size));
+    CUDA_CHECK(cudaMalloc(&d_gathered_value, gathered_size));
     
     // Shared memory sizes
     // TopK Kernel: scores + indices + sort storage
@@ -1107,30 +1162,44 @@ void run_retrieval_attention_two_kernels(
                               KEYS_PER_BLOCK * sizeof(int) + 
                               sizeof(typename BlockSort::TempStorage);
                               
-    // Reduce Kernel: all_scores + all_indices + probs + output + reduction
-    size_t reduce_shared_size = TOTAL_TOPK * sizeof(half) + 
-                                TOTAL_TOPK * sizeof(int) + 
-                                TOTAL_TOPK * sizeof(half) + 
-                                HEAD_DIM * sizeof(half) + 
-                                32 * sizeof(half);
+    // Baseline Kernel Shared Memory
+    size_t baseline_shared_size = (TOTAL_TOPK + HEAD_DIM) * sizeof(half) + 256 * sizeof(half);
     
-    printf("Retrieval Attention Two-Kernels Config: TOPK=%d, TOTAL_TOPK=%d\n", TOPK, TOTAL_TOPK);
+    printf("Retrieval Attention Gather+Baseline Config: TOPK=%d, TOTAL_TOPK=%d\n", TOPK, TOTAL_TOPK);
     
     // Grids
     dim3 grid_topk(batch_size * NUM_HEADS, QK_BLOCKS_PER_CLUSTER);
     dim3 block_topk(BLOCK_SIZE);
     
-    dim3 grid_reduce(batch_size * NUM_HEADS);
-    dim3 block_reduce(BLOCK_SIZE);
+    dim3 grid_gather(batch_size * NUM_HEADS, TOTAL_TOPK);
+    dim3 block_gather(128); // Enough for HEAD_DIM=128
+    
+    dim3 grid_baseline(NUM_HEADS); // Per batch
+    dim3 block_baseline(256);
     
     // Warmup
     for (int i = 0; i < 10; i++) {
+        // 1. TopK
         retrieval_topk_kernel<TOPK_PER_BLOCK><<<grid_topk, block_topk, topk_shared_size>>>(
             d_query, d_key_cache, d_global_scores, d_global_indices
         );
-        retrieval_reduce_kernel<TOPK_PER_BLOCK><<<grid_reduce, block_reduce, reduce_shared_size>>>(
-            d_value_cache, d_output, d_global_scores, d_global_indices
+        
+        // 2. Gather
+        gather_kv_kernel<<<grid_gather, block_gather>>>(
+            d_key_cache, d_value_cache, d_global_indices, d_gathered_key, d_gathered_value, TOTAL_TOPK
         );
+        
+        // 3. Baseline (Loop over batch)
+        for (int b = 0; b < batch_size; b++) {
+            const half* q_ptr = d_query + b * NUM_HEADS * HEAD_DIM;
+            const half* k_ptr = d_gathered_key + b * TOTAL_TOPK * NUM_HEADS * HEAD_DIM;
+            const half* v_ptr = d_gathered_value + b * TOTAL_TOPK * NUM_HEADS * HEAD_DIM;
+            half* out_ptr = d_output + b * NUM_HEADS * HEAD_DIM;
+            
+            baseline_attention_kernel<<<grid_baseline, block_baseline, baseline_shared_size>>>(
+                q_ptr, k_ptr, v_ptr, out_ptr, TOTAL_TOPK
+            );
+        }
     }
     CUDA_CHECK(cudaDeviceSynchronize());
     
@@ -1141,12 +1210,27 @@ void run_retrieval_attention_two_kernels(
     
     CUDA_CHECK(cudaEventRecord(start));
     for (int i = 0; i < num_iterations; i++) {
+        // 1. TopK
         retrieval_topk_kernel<TOPK_PER_BLOCK><<<grid_topk, block_topk, topk_shared_size>>>(
             d_query, d_key_cache, d_global_scores, d_global_indices
         );
-        retrieval_reduce_kernel<TOPK_PER_BLOCK><<<grid_reduce, block_reduce, reduce_shared_size>>>(
-            d_value_cache, d_output, d_global_scores, d_global_indices
+        
+        // 2. Gather
+        gather_kv_kernel<<<grid_gather, block_gather>>>(
+            d_key_cache, d_value_cache, d_global_indices, d_gathered_key, d_gathered_value, TOTAL_TOPK
         );
+        
+        // 3. Baseline (Loop over batch)
+        for (int b = 0; b < batch_size; b++) {
+            const half* q_ptr = d_query + b * NUM_HEADS * HEAD_DIM;
+            const half* k_ptr = d_gathered_key + b * TOTAL_TOPK * NUM_HEADS * HEAD_DIM;
+            const half* v_ptr = d_gathered_value + b * TOTAL_TOPK * NUM_HEADS * HEAD_DIM;
+            half* out_ptr = d_output + b * NUM_HEADS * HEAD_DIM;
+            
+            baseline_attention_kernel<<<grid_baseline, block_baseline, baseline_shared_size>>>(
+                q_ptr, k_ptr, v_ptr, out_ptr, TOTAL_TOPK
+            );
+        }
     }
     CUDA_CHECK(cudaEventRecord(stop));
     CUDA_CHECK(cudaEventSynchronize(stop));
@@ -1154,7 +1238,7 @@ void run_retrieval_attention_two_kernels(
     float milliseconds = 0;
     CUDA_CHECK(cudaEventElapsedTime(&milliseconds, start, stop));
     
-    printf("Retrieval Attention (Two Kernels) - Avg time: %.3f ms, Throughput: %.2f iter/s\n",
+    printf("Retrieval Attention (Gather+Baseline) - Avg time: %.3f ms, Throughput: %.2f iter/s\n",
            milliseconds / num_iterations,
            num_iterations * 1000.0f / milliseconds);
     
@@ -1163,6 +1247,8 @@ void run_retrieval_attention_two_kernels(
     
     CUDA_CHECK(cudaFree(d_global_scores));
     CUDA_CHECK(cudaFree(d_global_indices));
+    CUDA_CHECK(cudaFree(d_gathered_key));
+    CUDA_CHECK(cudaFree(d_gathered_value));
 }
 
 // ============================================================================
@@ -1445,6 +1531,95 @@ void run_retrieval_attention_pipelined(
     CUDA_CHECK(cudaEventDestroy(stop));
 }
 
+template<int TOPK_PER_BLOCK>
+void run_retrieval_attention_two_kernels(
+    const half* d_query,
+    const half* d_key_cache,
+    const half* d_value_cache,
+    half* d_output,
+    int batch_size = 1,
+    int num_iterations = 100
+) {
+    using Config = KernelConfig<TOPK_PER_BLOCK>;
+    constexpr int BLOCK_SIZE = Config::BLOCK_SIZE;
+    constexpr int TOPK = Config::TOPK;
+    constexpr int TOTAL_TOPK = Config::TOTAL_TOPK;
+    constexpr int KEYS_PER_BLOCK = Config::KEYS_PER_QK_BLOCK;
+    
+    // Allocate temporary global memory for scores and indices
+    half* d_global_scores;
+    int* d_global_indices;
+    
+    size_t scores_size = batch_size * NUM_HEADS * TOTAL_TOPK * sizeof(half);
+    size_t indices_size = batch_size * NUM_HEADS * TOTAL_TOPK * sizeof(int);
+    
+    CUDA_CHECK(cudaMalloc(&d_global_scores, scores_size));
+    CUDA_CHECK(cudaMalloc(&d_global_indices, indices_size));
+    
+    // Shared memory sizes
+    // TopK Kernel: scores + indices + sort storage
+    using BlockSort = cub::BlockRadixSort<float, BLOCK_SIZE, Config::ITEMS_PER_THREAD, int>;
+    size_t topk_shared_size = KEYS_PER_BLOCK * sizeof(float) + 
+                              KEYS_PER_BLOCK * sizeof(int) + 
+                              sizeof(typename BlockSort::TempStorage);
+                              
+    // Reduce Kernel: scores + indices + probs + output
+    size_t reduce_shared_size = TOTAL_TOPK * sizeof(half) + 
+                                TOTAL_TOPK * sizeof(int) + 
+                                TOTAL_TOPK * sizeof(half) + 
+                                HEAD_DIM * sizeof(half);
+    
+    printf("Retrieval Attention Two Kernels Config: TOPK=%d, TOTAL_TOPK=%d\n", TOPK, TOTAL_TOPK);
+    
+    // Grids
+    dim3 grid_topk(batch_size * NUM_HEADS, QK_BLOCKS_PER_CLUSTER);
+    dim3 block_topk(BLOCK_SIZE);
+    
+    dim3 grid_reduce(batch_size * NUM_HEADS);
+    dim3 block_reduce(256);
+    
+    // Warmup
+    for (int i = 0; i < 10; i++) {
+        retrieval_topk_kernel<TOPK_PER_BLOCK><<<grid_topk, block_topk, topk_shared_size>>>(
+            d_query, d_key_cache, d_global_scores, d_global_indices
+        );
+        retrieval_reduce_kernel<TOPK_PER_BLOCK><<<grid_reduce, block_reduce, reduce_shared_size>>>(
+            d_value_cache, d_output, d_global_scores, d_global_indices
+        );
+    }
+    CUDA_CHECK(cudaDeviceSynchronize());
+    
+    // Benchmark
+    cudaEvent_t start, stop;
+    CUDA_CHECK(cudaEventCreate(&start));
+    CUDA_CHECK(cudaEventCreate(&stop));
+    
+    CUDA_CHECK(cudaEventRecord(start));
+    for (int i = 0; i < num_iterations; i++) {
+        retrieval_topk_kernel<TOPK_PER_BLOCK><<<grid_topk, block_topk, topk_shared_size>>>(
+            d_query, d_key_cache, d_global_scores, d_global_indices
+        );
+        retrieval_reduce_kernel<TOPK_PER_BLOCK><<<grid_reduce, block_reduce, reduce_shared_size>>>(
+            d_value_cache, d_output, d_global_scores, d_global_indices
+        );
+    }
+    CUDA_CHECK(cudaEventRecord(stop));
+    CUDA_CHECK(cudaEventSynchronize(stop));
+    
+    float milliseconds = 0;
+    CUDA_CHECK(cudaEventElapsedTime(&milliseconds, start, stop));
+    
+    printf("Retrieval Attention (Two Kernels) - Avg time: %.3f ms, Throughput: %.2f iter/s\n",
+           milliseconds / num_iterations,
+           num_iterations * 1000.0f / milliseconds);
+    
+    CUDA_CHECK(cudaEventDestroy(start));
+    CUDA_CHECK(cudaEventDestroy(stop));
+    
+    CUDA_CHECK(cudaFree(d_global_scores));
+    CUDA_CHECK(cudaFree(d_global_indices));
+}
+
 #ifdef TORCH_EXTENSION_NAME
 // Wrapper for PyTorch extension
 void launch_retrieval_attention_32(
@@ -1495,6 +1670,56 @@ void launch_retrieval_attention_1024(
     int batch_size
 ) {
     run_retrieval_attention<1024>(query, key_cache, value_cache, output, batch_size, 1);
+}
+
+void launch_retrieval_attention_gather_baseline_32(
+    const half* query,
+    const half* key_cache,
+    const half* value_cache,
+    half* output,
+    int batch_size
+) {
+    run_retrieval_attention_gather_baseline<32>(query, key_cache, value_cache, output, batch_size, 1);
+}
+
+void launch_retrieval_attention_gather_baseline_128(
+    const half* query,
+    const half* key_cache,
+    const half* value_cache,
+    half* output,
+    int batch_size
+) {
+    run_retrieval_attention_gather_baseline<128>(query, key_cache, value_cache, output, batch_size, 1);
+}
+
+void launch_retrieval_attention_gather_baseline_256(
+    const half* query,
+    const half* key_cache,
+    const half* value_cache,
+    half* output,
+    int batch_size
+) {
+    run_retrieval_attention_gather_baseline<256>(query, key_cache, value_cache, output, batch_size, 1);
+}
+
+void launch_retrieval_attention_gather_baseline_512(
+    const half* query,
+    const half* key_cache,
+    const half* value_cache,
+    half* output,
+    int batch_size
+) {
+    run_retrieval_attention_gather_baseline<512>(query, key_cache, value_cache, output, batch_size, 1);
+}
+
+void launch_retrieval_attention_gather_baseline_1024(
+    const half* query,
+    const half* key_cache,
+    const half* value_cache,
+    half* output,
+    int batch_size
+) {
+    run_retrieval_attention_gather_baseline<1024>(query, key_cache, value_cache, output, batch_size, 1);
 }
 
 void launch_retrieval_attention_global_32(
@@ -1646,6 +1871,9 @@ void launch_retrieval_attention_two_kernels_1024(
 ) {
     run_retrieval_attention_two_kernels<1024>(query, key_cache, value_cache, output, batch_size, 1);
 }
+
+
+
 #else
 
 void initialize_data(half* query, half* key_cache, half* value_cache) {
@@ -1677,7 +1905,7 @@ void run_baseline_attention(
     // Warmup
     for (int i = 0; i < 10; i++) {
         baseline_attention_kernel<<<NUM_HEADS, BLOCK_SIZE, shared_mem_size>>>(
-            d_query, d_key_cache, d_value_cache, d_output
+            d_query, d_key_cache, d_value_cache, d_output, SEQ_LEN
         );
     }
     CUDA_CHECK(cudaDeviceSynchronize());
@@ -1690,7 +1918,7 @@ void run_baseline_attention(
     CUDA_CHECK(cudaEventRecord(start));
     for (int i = 0; i < num_iterations; i++) {
         baseline_attention_kernel<<<NUM_HEADS, BLOCK_SIZE, shared_mem_size>>>(
-            d_query, d_key_cache, d_value_cache, d_output
+            d_query, d_key_cache, d_value_cache, d_output, SEQ_LEN
         );
     }
     CUDA_CHECK(cudaEventRecord(stop));
