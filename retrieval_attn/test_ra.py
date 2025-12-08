@@ -232,6 +232,34 @@ def run_test(topk=128, batch_size=4):
     else:
         print("Global Kernel: FAILED")
 
+    # Run Pipelined Kernel (Global Buffer)
+    output_kernel_pipelined_global = torch.zeros(batch_size, NUM_HEADS, HEAD_DIM, device=device, dtype=torch.float16)
+    print("Running Pipelined Global Kernel...")
+    with CaptureOutput() as capturer:
+        if topk == 32:
+            ra_ops.retrieval_attention_pipelined_global_32(q, k, v, output_kernel_pipelined_global)
+        elif topk == 128:
+            ra_ops.retrieval_attention_pipelined_global_128(q, k, v, output_kernel_pipelined_global)
+        elif topk == 256:
+            ra_ops.retrieval_attention_pipelined_global_256(q, k, v, output_kernel_pipelined_global)
+        elif topk == 512:
+            ra_ops.retrieval_attention_pipelined_global_512(q, k, v, output_kernel_pipelined_global)
+        elif topk == 1024:
+            ra_ops.retrieval_attention_pipelined_global_1024(q, k, v, output_kernel_pipelined_global)
+    parse_and_record(capturer.captured, topk, "Pipelined(Global)")
+
+    diff_pipelined_global = (output_kernel_pipelined_global - output_ref).abs()
+    max_diff_pipelined_global = diff_pipelined_global.max().item()
+    mean_diff_pipelined_global = diff_pipelined_global.mean().item()
+
+    print(f"Pipelined Global Kernel - Max diff: {max_diff_pipelined_global}")
+    print(f"Pipelined Global Kernel - Mean diff: {mean_diff_pipelined_global}")
+
+    if max_diff_pipelined_global < 1e-2:
+        print("Pipelined Global Kernel: PASSED")
+    else:
+        print("Pipelined Global Kernel: FAILED")
+
     # Run Pipelined Kernel
     output_kernel_pipelined = torch.zeros(batch_size, NUM_HEADS, HEAD_DIM, device=device, dtype=torch.float16)
     print("Running Pipelined Kernel...")
@@ -246,7 +274,7 @@ def run_test(topk=128, batch_size=4):
             ra_ops.retrieval_attention_pipelined_512(q, k, v, output_kernel_pipelined)
         elif topk == 1024:
             ra_ops.retrieval_attention_pipelined_1024(q, k, v, output_kernel_pipelined)
-    parse_and_record(capturer.captured, topk, "Pipelined")
+    parse_and_record(capturer.captured, topk, "Pipelined(DSM)")
 
     diff_pipelined = (output_kernel_pipelined - output_ref).abs()
     max_diff_pipelined = diff_pipelined.max().item()
@@ -324,8 +352,8 @@ if __name__ == "__main__":
     run_test(1024, batch_size=4)
 
     print("\nPerformance Results (Batch Size = 4):")
-    print(f"| {'TopK':<5} | {'Kernel Type':<10} | {'Avg Time (ms)':<15} | {'Throughput (iter/s)':<20} |")
-    print(f"|{'-'*7}|{'-'*12}|{'-'*17}|{'-'*22}|")
+    print(f"| {'TopK':<5} | {'Kernel Type':<20} | {'Avg Time (ms)':<15} | {'Throughput (iter/s)':<20} |")
+    print(f"|{'-'*7}|{'-'*22}|{'-'*17}|{'-'*22}|")
     for res in results:
-        print(f"| {res['TopK']:<5} | {res['Kernel']:<10} | {res['Avg Time (ms)']:<15.3f} | {res['Throughput (iter/s)']:<20.2f} |")
+        print(f"| {res['TopK']:<5} | {res['Kernel']:<20} | {res['Avg Time (ms)']:<15.3f} | {res['Throughput (iter/s)']:<20.2f} |")
 
