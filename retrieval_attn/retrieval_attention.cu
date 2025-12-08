@@ -49,12 +49,13 @@ struct KernelConfig {
 // Baseline Attention Kernel (No Retrieval)
 // ============================================================================
 __global__ void baseline_attention_kernel(
-    const half* __restrict__ query,      // [1, NUM_HEADS, HEAD_DIM]
+    const half* __restrict__ query,      // [BATCH_SIZE, NUM_HEADS, HEAD_DIM]
     const half* __restrict__ key_cache,  // [SEQ_LEN, NUM_HEADS, HEAD_DIM]
     const half* __restrict__ value_cache,// [SEQ_LEN, NUM_HEADS, HEAD_DIM]
-    half* __restrict__ output            // [1, NUM_HEADS, HEAD_DIM]
+    half* __restrict__ output            // [BATCH_SIZE, NUM_HEADS, HEAD_DIM]
 ) {
-    int head_idx = blockIdx.x;
+    int batch_idx = blockIdx.x / NUM_HEADS;
+    int head_idx = blockIdx.x % NUM_HEADS;
     int tid = threadIdx.x;
     int block_size = blockDim.x;
     
@@ -64,7 +65,7 @@ __global__ void baseline_attention_kernel(
     half* s_output = &shared_mem[SEQ_LEN];
     __shared__ half s_reduce[256];
     
-    const half* q = query + head_idx * HEAD_DIM;
+    const half* q = query + (batch_idx * NUM_HEADS + head_idx) * HEAD_DIM;
     const half* k_base = key_cache + head_idx * HEAD_DIM;
     const half* v_base = value_cache + head_idx * HEAD_DIM;
     
@@ -159,7 +160,7 @@ __global__ void baseline_attention_kernel(
     __syncthreads();
     
     // Write output
-    half* out = output + head_idx * HEAD_DIM;
+    half* out = output + (batch_idx * NUM_HEADS + head_idx) * HEAD_DIM;
     for (int d = tid; d < HEAD_DIM; d += block_size) {
         out[d] = s_output[d];
     }
@@ -252,10 +253,10 @@ __device__ void select_topk_indices(
 template<int TOPK_PER_BLOCK>
 __cluster_dims__(1, CLUSTER_SIZE, 1)
 __global__ void retrieval_attention_kernel(
-    const half* __restrict__ query,      // [1, NUM_HEADS, HEAD_DIM]
+    const half* __restrict__ query,      // [BATCH_SIZE, NUM_HEADS, HEAD_DIM]
     const half* __restrict__ key_cache,  // [SEQ_LEN, NUM_HEADS, HEAD_DIM]
     const half* __restrict__ value_cache,// [SEQ_LEN, NUM_HEADS, HEAD_DIM]
-    half* __restrict__ output            // [1, NUM_HEADS, HEAD_DIM]
+    half* __restrict__ output            // [BATCH_SIZE, NUM_HEADS, HEAD_DIM]
 ) {
     using Config = KernelConfig<TOPK_PER_BLOCK>;
     constexpr int TOPK = Config::TOPK;
@@ -267,7 +268,8 @@ __global__ void retrieval_attention_kernel(
     // Cluster and block info
     cg::cluster_group cluster = cg::this_cluster();
     int cluster_rank = cluster.block_rank(); // 0-4 within cluster
-    int head_idx = blockIdx.x;
+    int batch_idx = blockIdx.x / NUM_HEADS;
+    int head_idx = blockIdx.x % NUM_HEADS;
     int tid = threadIdx.x;
     int block_size = blockDim.x;
     
@@ -276,7 +278,7 @@ __global__ void retrieval_attention_kernel(
     bool is_pv_block = (cluster_rank == QK_BLOCKS_PER_CLUSTER);
     
     // Pointers for this head
-    const half* q = query + head_idx * HEAD_DIM;
+    const half* q = query + (batch_idx * NUM_HEADS + head_idx) * HEAD_DIM;
     const half* k_base = key_cache + head_idx * HEAD_DIM;
     const half* v_base = value_cache + head_idx * HEAD_DIM;
     
@@ -458,7 +460,7 @@ __global__ void retrieval_attention_kernel(
         __syncthreads();
         
         // Write output
-        half* out = output + head_idx * HEAD_DIM;
+        half* out = output + (batch_idx * NUM_HEADS + head_idx) * HEAD_DIM;
         for (int d = tid; d < HEAD_DIM; d += block_size) {
             out[d] = s_output[d];
         }
@@ -474,12 +476,12 @@ __global__ void retrieval_attention_kernel(
 template<int TOPK_PER_BLOCK>
 __cluster_dims__(1, CLUSTER_SIZE, 1)
 __global__ void retrieval_attention_global_kernel(
-    const half* __restrict__ query,      // [1, NUM_HEADS, HEAD_DIM]
+    const half* __restrict__ query,      // [BATCH_SIZE, NUM_HEADS, HEAD_DIM]
     const half* __restrict__ key_cache,  // [SEQ_LEN, NUM_HEADS, HEAD_DIM]
     const half* __restrict__ value_cache,// [SEQ_LEN, NUM_HEADS, HEAD_DIM]
-    half* __restrict__ output,           // [1, NUM_HEADS, HEAD_DIM]
-    half* __restrict__ global_scores,    // [NUM_HEADS, TOTAL_TOPK]
-    int* __restrict__ global_indices     // [NUM_HEADS, TOTAL_TOPK]
+    half* __restrict__ output,           // [BATCH_SIZE, NUM_HEADS, HEAD_DIM]
+    half* __restrict__ global_scores,    // [BATCH_SIZE, NUM_HEADS, TOTAL_TOPK]
+    int* __restrict__ global_indices     // [BATCH_SIZE, NUM_HEADS, TOTAL_TOPK]
 ) {
     using Config = KernelConfig<TOPK_PER_BLOCK>;
     constexpr int TOPK = Config::TOPK;
@@ -491,7 +493,8 @@ __global__ void retrieval_attention_global_kernel(
     // Cluster and block info
     cg::cluster_group cluster = cg::this_cluster();
     int cluster_rank = cluster.block_rank(); // 0-4 within cluster
-    int head_idx = blockIdx.x;
+    int batch_idx = blockIdx.x / NUM_HEADS;
+    int head_idx = blockIdx.x % NUM_HEADS;
     int tid = threadIdx.x;
     int block_size = blockDim.x;
     
@@ -500,7 +503,7 @@ __global__ void retrieval_attention_global_kernel(
     bool is_pv_block = (cluster_rank == QK_BLOCKS_PER_CLUSTER);
     
     // Pointers for this head
-    const half* q = query + head_idx * HEAD_DIM;
+    const half* q = query + (batch_idx * NUM_HEADS + head_idx) * HEAD_DIM;
     const half* k_base = key_cache + head_idx * HEAD_DIM;
     const half* v_base = value_cache + head_idx * HEAD_DIM;
     
@@ -553,7 +556,7 @@ __global__ void retrieval_attention_global_kernel(
         __syncthreads();
         
         // Write to Global Memory
-        int global_offset = head_idx * TOTAL_TOPK + cluster_rank * TOPK;
+        int global_offset = (batch_idx * NUM_HEADS + head_idx) * TOTAL_TOPK + cluster_rank * TOPK;
         for (int i = tid; i < TOPK; i += BLOCK_SIZE) {
             global_scores[global_offset + i] = __float2half(s_scores[i]);
             global_indices[global_offset + i] = key_start + s_indices[i];
@@ -574,7 +577,7 @@ __global__ void retrieval_attention_global_kernel(
         half* s_output = &s_probs[TOTAL_TOPK];
         
         // Read from Global Memory
-        int global_offset = head_idx * TOTAL_TOPK;
+        int global_offset = (batch_idx * NUM_HEADS + head_idx) * TOTAL_TOPK;
         for (int i = tid; i < TOTAL_TOPK; i += block_size) {
             s_all_scores[i] = global_scores[global_offset + i];
             s_all_indices[i] = global_indices[global_offset + i];
@@ -639,11 +642,258 @@ __global__ void retrieval_attention_global_kernel(
         __syncthreads();
         
         // Write output
-        half* out = output + head_idx * HEAD_DIM;
+        half* out = output + (batch_idx * NUM_HEADS + head_idx) * HEAD_DIM;
         for (int d = tid; d < HEAD_DIM; d += block_size) {
             out[d] = s_output[d];
         }
     }
+}
+
+// ============================================================================
+// Retrieval Attention Kernel with Pipelined Batch Processing
+// ============================================================================
+template<int TOPK_PER_BLOCK>
+__cluster_dims__(1, CLUSTER_SIZE, 1)
+__global__ void retrieval_attention_pipelined_kernel(
+    const half* __restrict__ query,      // [BATCH_SIZE, NUM_HEADS, HEAD_DIM]
+    const half* __restrict__ key_cache,  // [SEQ_LEN, NUM_HEADS, HEAD_DIM]
+    const half* __restrict__ value_cache,// [SEQ_LEN, NUM_HEADS, HEAD_DIM]
+    half* __restrict__ output,           // [BATCH_SIZE, NUM_HEADS, HEAD_DIM]
+    int batch_size
+) {
+    using Config = KernelConfig<TOPK_PER_BLOCK>;
+    constexpr int TOPK = Config::TOPK;
+    constexpr int TOTAL_TOPK = Config::TOTAL_TOPK;
+    constexpr int KEYS_PER_BLOCK = Config::KEYS_PER_QK_BLOCK;
+    constexpr int BLOCK_SIZE = Config::BLOCK_SIZE;
+    constexpr int ITEMS_PER_THREAD = Config::ITEMS_PER_THREAD;
+    
+    // Cluster and block info
+    cg::cluster_group cluster = cg::this_cluster();
+    int cluster_rank = cluster.block_rank(); // 0-4 within cluster
+    int head_idx = blockIdx.x; // One cluster per head
+    int tid = threadIdx.x;
+    int block_size = blockDim.x;
+    
+    // Determine role: QK blocks (0-3) or PV block (4)
+    bool is_qk_block = (cluster_rank < QK_BLOCKS_PER_CLUSTER);
+    bool is_pv_block = (cluster_rank == QK_BLOCKS_PER_CLUSTER);
+    
+    // Pointers for this head (KV is shared across batch)
+    const half* k_base = key_cache + head_idx * HEAD_DIM;
+    const half* v_base = value_cache + head_idx * HEAD_DIM;
+    
+    // Shared memory layout
+    extern __shared__ half shared_mem[];
+    
+    // PV block: Initialize counters at the start of shared memory
+    if (is_pv_block) {
+        if (tid == 0) {
+            // Ready counter: tracks how many QK blocks have finished writing current batch
+            volatile int* ready_counter = (int*)shared_mem;
+            *ready_counter = 0;
+            
+            // Done counter: tracks how many batches PV has finished consuming
+            volatile int* done_counter = (int*)shared_mem + 1;
+            *done_counter = 0;
+        }
+        __syncthreads();
+    }
+    
+    // ALL blocks sync to ensure counters are initialized
+    cluster.sync();
+    
+    // QK blocks: compute scores and find topk
+    if (is_qk_block) {
+        // Offset shared memory to avoid counters (2 ints)
+        // Use float for scores to support CUB sort
+        float* s_scores = (float*)((int*)shared_mem + 2);
+        int* s_indices = (int*)&s_scores[KEYS_PER_BLOCK];
+        
+        // CUB Sort Storage
+        using BlockSort = cub::BlockRadixSort<float, BLOCK_SIZE, ITEMS_PER_THREAD, int>;
+        __shared__ typename BlockSort::TempStorage sort_storage;
+        
+        // Compute scores for this block's key range
+        int key_start = cluster_rank * KEYS_PER_BLOCK;
+        
+        // Map distributed shared memory to PV block (rank 4)
+        half* dsm_base = (half*)cluster.map_shared_rank(shared_mem, QK_BLOCKS_PER_CLUSTER);
+        volatile int* dsm_ready_counter = (volatile int*)dsm_base;
+        volatile int* dsm_done_counter = (volatile int*)dsm_base + 1;
+        
+        half* dsm_scores = (half*)((int*)dsm_base + 2);  // Skip counters
+        int* dsm_indices = (int*)&dsm_scores[TOTAL_TOPK];
+        
+        // Loop over batches
+        for (int b = 0; b < batch_size; ++b) {
+            // 1. Compute QK for batch 'b'
+            const half* q = query + (b * NUM_HEADS + head_idx) * HEAD_DIM;
+            
+            // Thread-local storage for sorting
+            float thread_keys[ITEMS_PER_THREAD];
+            int thread_values[ITEMS_PER_THREAD];
+            
+            for (int item = 0; item < ITEMS_PER_THREAD; ++item) {
+                int local_idx = tid * ITEMS_PER_THREAD + item;
+                int global_key_idx = key_start + local_idx;
+                const half* k = k_base + global_key_idx * NUM_HEADS * HEAD_DIM;
+                
+                float score = 0.0f;
+                #pragma unroll 8
+                for (int d = 0; d < HEAD_DIM; d++) {
+                    score += __half2float(q[d]) * __half2float(k[d]);
+                }
+                thread_keys[item] = score;
+                thread_values[item] = local_idx;
+            }
+            
+            // Sort
+            BlockSort(sort_storage).SortDescending(thread_keys, thread_values);
+            
+            // 2. Wait for PV to finish previous batch (if any)
+            // We need to write to PV's SMEM, so we must ensure PV is done with batch b-1
+            // Condition: done_counter >= b
+            if (tid == 0) {
+                while (*dsm_done_counter < b) {
+                    // Busy wait
+                }
+            }
+            __syncthreads();
+            
+            // 3. Write sorted results to shared memory (only need top K)
+            // First write to local SMEM to gather
+            for (int item = 0; item < ITEMS_PER_THREAD; ++item) {
+                int rank = tid * ITEMS_PER_THREAD + item;
+                if (rank < TOPK) {
+                    s_scores[rank] = thread_keys[item];
+                    s_indices[rank] = thread_values[item];
+                }
+            }
+            __syncthreads();
+            
+            // Write to PV block's memory via DSM
+            int offset = cluster_rank * TOPK;
+            for (int i = tid; i < TOPK; i += BLOCK_SIZE) {
+                dsm_scores[offset + i] = __float2half(s_scores[i]);
+            }
+            __threadfence_block();
+            
+            for (int i = tid; i < TOPK; i += BLOCK_SIZE) {
+                int local_idx = s_indices[i];
+                dsm_indices[offset + i] = key_start + local_idx;
+            }
+            __threadfence_block();
+            
+            // 4. Signal completion
+            if (tid == 0) {
+                atomicAdd_system((int*)dsm_ready_counter, 1);
+            }
+        }
+    }
+    
+    // PV block: wait for QK, compute PV, signal done
+    if (is_pv_block) {
+        volatile int* ready_counter = (volatile int*)shared_mem;
+        volatile int* done_counter = (volatile int*)shared_mem + 1;
+        
+        // Data layout: [counters][scores][indices][probs][output][reduction]
+        half* s_all_scores = (half*)((int*)shared_mem + 2);
+        int* s_all_indices = (int*)&s_all_scores[TOTAL_TOPK];
+        half* s_probs = (half*)&s_all_indices[TOTAL_TOPK];
+        half* s_output = &s_probs[TOTAL_TOPK];
+        
+        for (int b = 0; b < batch_size; ++b) {
+            // 1. Wait for all QK blocks to finish batch 'b'
+            // Target count: (b + 1) * QK_BLOCKS_PER_CLUSTER
+            int target_ready = (b + 1) * QK_BLOCKS_PER_CLUSTER;
+            
+            if (tid == 0) {
+                while (*ready_counter < target_ready) {
+                    // Busy wait
+                }
+            }
+            __syncthreads();
+            
+            // 2. Compute Softmax & PV
+            // Simple softmax
+            half sum = __float2half(0.0f);
+            for (int i = tid; i < TOTAL_TOPK; i += block_size) {
+                half exp_val = hexp(s_all_scores[i]);
+                s_probs[i] = exp_val;
+                sum = __hadd(sum, exp_val);
+            }
+            
+            // Reduce sum
+            __syncthreads();
+            __shared__ half s_sum_reduce[32];
+            
+            int warp_id = tid / 32;
+            int lane_id = tid % 32;
+            
+            for (int offset = 16; offset > 0; offset /= 2) {
+                sum = __hadd(sum, __shfl_down_sync(0xffffffff, sum, offset));
+            }
+            
+            if (lane_id == 0) {
+                s_sum_reduce[warp_id] = sum;
+            }
+            __syncthreads();
+            
+            if (tid == 0) {
+                sum = __float2half(0.0f);
+                int num_warps = (block_size + 31) / 32;
+                for (int i = 0; i < num_warps; i++) {
+                    sum = __hadd(sum, s_sum_reduce[i]);
+                }
+                s_sum_reduce[0] = sum;
+            }
+            __syncthreads();
+            sum = s_sum_reduce[0];
+            
+            // Normalize
+            for (int i = tid; i < TOTAL_TOPK; i += block_size) {
+                s_probs[i] = __hdiv(s_probs[i], sum);
+            }
+            __syncthreads();
+            
+            // Compute P @ V
+            for (int d = tid; d < HEAD_DIM; d += block_size) {
+                half acc = __float2half(0.0f);
+                for (int i = 0; i < TOTAL_TOPK; i++) {
+                    int key_idx = s_all_indices[i];
+                    if (key_idx >= 0 && key_idx < SEQ_LEN) {
+                        const half* v = v_base + key_idx * NUM_HEADS * HEAD_DIM;
+                        acc = __hadd(acc, __hmul(s_probs[i], v[d]));
+                    }
+                }
+                s_output[d] = acc;
+            }
+            __syncthreads();
+            
+            // Write output
+            half* out = output + (b * NUM_HEADS + head_idx) * HEAD_DIM;
+            for (int d = tid; d < HEAD_DIM; d += block_size) {
+                out[d] = s_output[d];
+            }
+            
+            // 3. Signal done (buffer free for next batch)
+            // Ensure all reads from SMEM are done before signaling
+            __syncthreads();
+            __threadfence_block(); // Ensure writes to global memory are visible? No, we need to ensure reads from SMEM are done.
+            // __syncthreads() is enough for block-level sync.
+            
+            if (tid == 0) {
+                // Signal that we are done with batch 'b'
+                // QK blocks waiting for 'b+1' will check if done_counter >= b+1
+                // So we increment to b+1
+                atomicAdd((int*)done_counter, 1);
+                __threadfence_system(); // Ensure visibility to other blocks in cluster
+            }
+        }
+    }
+    
+    cluster.sync();
 }
 
 // ============================================================================
@@ -656,6 +906,7 @@ void run_retrieval_attention(
     const half* d_key_cache,
     const half* d_value_cache,
     half* d_output,
+    int batch_size = 1,
     int num_iterations = 100
 ) {
     using Config = KernelConfig<TOPK_PER_BLOCK>;
@@ -713,7 +964,7 @@ void run_retrieval_attention(
     ));
     
     // Warmup
-    dim3 grid(NUM_HEADS, CLUSTER_SIZE);
+    dim3 grid(batch_size * NUM_HEADS, CLUSTER_SIZE);
     dim3 block(BLOCK_SIZE);
     
     for (int i = 0; i < 10; i++) {
@@ -754,6 +1005,7 @@ void run_retrieval_attention_global(
     const half* d_key_cache,
     const half* d_value_cache,
     half* d_output,
+    int batch_size = 1,
     int num_iterations = 100
 ) {
     using Config = KernelConfig<TOPK_PER_BLOCK>;
@@ -784,8 +1036,8 @@ void run_retrieval_attention_global(
     // Allocate global memory buffers
     half* d_global_scores;
     int* d_global_indices;
-    size_t scores_size = NUM_HEADS * TOTAL_TOPK * sizeof(half);
-    size_t indices_size = NUM_HEADS * TOTAL_TOPK * sizeof(int);
+    size_t scores_size = batch_size * NUM_HEADS * TOTAL_TOPK * sizeof(half);
+    size_t indices_size = batch_size * NUM_HEADS * TOTAL_TOPK * sizeof(int);
     
     CUDA_CHECK(cudaMalloc(&d_global_scores, scores_size));
     CUDA_CHECK(cudaMalloc(&d_global_indices, indices_size));
@@ -804,7 +1056,7 @@ void run_retrieval_attention_global(
     ));
     
     // Warmup
-    dim3 grid(NUM_HEADS, CLUSTER_SIZE);
+    dim3 grid(batch_size * NUM_HEADS, CLUSTER_SIZE);
     dim3 block(BLOCK_SIZE);
     
     for (int i = 0; i < 10; i++) {
@@ -842,96 +1094,241 @@ void run_retrieval_attention_global(
     CUDA_CHECK(cudaFree(d_global_indices));
 }
 
+template<int TOPK_PER_BLOCK>
+void run_retrieval_attention_pipelined(
+    const half* d_query,
+    const half* d_key_cache,
+    const half* d_value_cache,
+    half* d_output,
+    int batch_size = 1,
+    int num_iterations = 100
+) {
+    using Config = KernelConfig<TOPK_PER_BLOCK>;
+    constexpr int BLOCK_SIZE = Config::BLOCK_SIZE;
+    constexpr int TOPK = Config::TOPK;
+    constexpr int TOTAL_TOPK = Config::TOTAL_TOPK;
+    constexpr int KEYS_PER_BLOCK = Config::KEYS_PER_QK_BLOCK;
+    
+    using BlockSort = cub::BlockRadixSort<float, BLOCK_SIZE, Config::ITEMS_PER_THREAD, int>;
+    
+    // QK blocks: 2 counters + scores + indices + CUB storage
+    size_t qk_shared_size = 2 * sizeof(int) +  // ready + done counters
+                            TOPK * sizeof(float) + // s_scores
+                            TOPK * sizeof(int) +   // s_indices
+                            sizeof(typename BlockSort::TempStorage);
+
+    // PV blocks: 2 counters + all_scores + all_indices + probs + output + reduction
+    size_t pv_shared_size = 2 * sizeof(int) +  // ready + done counters
+                           TOTAL_TOPK * sizeof(half) +  // all_scores
+                           TOTAL_TOPK * sizeof(int) +   // all_indices
+                           TOTAL_TOPK * sizeof(half) +  // probs
+                           HEAD_DIM * sizeof(half) +    // output
+                           32 * sizeof(half);           // reduction workspace
+    size_t shared_mem_size = max(qk_shared_size, pv_shared_size);
+    
+    printf("Retrieval Attention Pipelined Config: TOPK=%d, TOTAL_TOPK=%d, BLOCK_SIZE=%d\n", 
+           TOPK, TOTAL_TOPK, BLOCK_SIZE);
+    printf("Shared memory per block: %zu bytes (%.1f KB)\n", shared_mem_size, shared_mem_size / 1024.0f);
+    
+    CUDA_CHECK(cudaFuncSetAttribute(
+        retrieval_attention_pipelined_kernel<TOPK_PER_BLOCK>,
+        cudaFuncAttributeMaxDynamicSharedMemorySize,
+        shared_mem_size
+    ));
+    
+    CUDA_CHECK(cudaFuncSetAttribute(
+        retrieval_attention_pipelined_kernel<TOPK_PER_BLOCK>,
+        cudaFuncAttributePreferredSharedMemoryCarveout,
+        100
+    ));
+    
+    // Grid: One cluster per head (Batch loop inside kernel)
+    dim3 grid(NUM_HEADS, CLUSTER_SIZE);
+    dim3 block(BLOCK_SIZE);
+    
+    // Warmup
+    for (int i = 0; i < 10; i++) {
+        retrieval_attention_pipelined_kernel<TOPK_PER_BLOCK><<<grid, block, shared_mem_size>>>(
+            d_query, d_key_cache, d_value_cache, d_output, batch_size
+        );
+    }
+    CUDA_CHECK(cudaDeviceSynchronize());
+    
+    // Benchmark
+    cudaEvent_t start, stop;
+    CUDA_CHECK(cudaEventCreate(&start));
+    CUDA_CHECK(cudaEventCreate(&stop));
+    
+    CUDA_CHECK(cudaEventRecord(start));
+    for (int i = 0; i < num_iterations; i++) {
+        retrieval_attention_pipelined_kernel<TOPK_PER_BLOCK><<<grid, block, shared_mem_size>>>(
+            d_query, d_key_cache, d_value_cache, d_output, batch_size
+        );
+    }
+    CUDA_CHECK(cudaEventRecord(stop));
+    CUDA_CHECK(cudaEventSynchronize(stop));
+    
+    float milliseconds = 0;
+    CUDA_CHECK(cudaEventElapsedTime(&milliseconds, start, stop));
+    
+    printf("Retrieval Attention Pipelined - Avg time: %.3f ms, Throughput: %.2f iter/s\n",
+           milliseconds / num_iterations,
+           num_iterations * 1000.0f / milliseconds);
+    
+    CUDA_CHECK(cudaEventDestroy(start));
+    CUDA_CHECK(cudaEventDestroy(stop));
+}
+
 #ifdef TORCH_EXTENSION_NAME
 // Wrapper for PyTorch extension
 void launch_retrieval_attention_32(
     const half* query,
     const half* key_cache,
     const half* value_cache,
-    half* output
+    half* output,
+    int batch_size
 ) {
-    run_retrieval_attention<32>(query, key_cache, value_cache, output, 1);
+    run_retrieval_attention<32>(query, key_cache, value_cache, output, batch_size, 1);
 }
 
 void launch_retrieval_attention_128(
     const half* query,
     const half* key_cache,
     const half* value_cache,
-    half* output
+    half* output,
+    int batch_size
 ) {
-    run_retrieval_attention<128>(query, key_cache, value_cache, output, 1);
+    run_retrieval_attention<128>(query, key_cache, value_cache, output, batch_size, 1);
 }
 
 void launch_retrieval_attention_256(
     const half* query,
     const half* key_cache,
     const half* value_cache,
-    half* output
+    half* output,
+    int batch_size
 ) {
-    run_retrieval_attention<256>(query, key_cache, value_cache, output, 1);
+    run_retrieval_attention<256>(query, key_cache, value_cache, output, batch_size, 1);
 }
 
 void launch_retrieval_attention_512(
     const half* query,
     const half* key_cache,
     const half* value_cache,
-    half* output
+    half* output,
+    int batch_size
 ) {
-    run_retrieval_attention<512>(query, key_cache, value_cache, output, 1);
+    run_retrieval_attention<512>(query, key_cache, value_cache, output, batch_size, 1);
 }
 
 void launch_retrieval_attention_1024(
     const half* query,
     const half* key_cache,
     const half* value_cache,
-    half* output
+    half* output,
+    int batch_size
 ) {
-    run_retrieval_attention<1024>(query, key_cache, value_cache, output, 1);
+    run_retrieval_attention<1024>(query, key_cache, value_cache, output, batch_size, 1);
 }
 
 void launch_retrieval_attention_global_32(
     const half* query,
     const half* key_cache,
     const half* value_cache,
-    half* output
+    half* output,
+    int batch_size
 ) {
-    run_retrieval_attention_global<32>(query, key_cache, value_cache, output, 1);
+    run_retrieval_attention_global<32>(query, key_cache, value_cache, output, batch_size, 1);
 }
 
 void launch_retrieval_attention_global_128(
     const half* query,
     const half* key_cache,
     const half* value_cache,
-    half* output
+    half* output,
+    int batch_size
 ) {
-    run_retrieval_attention_global<128>(query, key_cache, value_cache, output, 1);
+    run_retrieval_attention_global<128>(query, key_cache, value_cache, output, batch_size, 1);
 }
 
 void launch_retrieval_attention_global_256(
     const half* query,
     const half* key_cache,
     const half* value_cache,
-    half* output
+    half* output,
+    int batch_size
 ) {
-    run_retrieval_attention_global<256>(query, key_cache, value_cache, output, 1);
+    run_retrieval_attention_global<256>(query, key_cache, value_cache, output, batch_size, 1);
 }
 
 void launch_retrieval_attention_global_512(
     const half* query,
     const half* key_cache,
     const half* value_cache,
-    half* output
+    half* output,
+    int batch_size
 ) {
-    run_retrieval_attention_global<512>(query, key_cache, value_cache, output, 1);
+    run_retrieval_attention_global<512>(query, key_cache, value_cache, output, batch_size, 1);
 }
 
 void launch_retrieval_attention_global_1024(
     const half* query,
     const half* key_cache,
     const half* value_cache,
-    half* output
+    half* output,
+    int batch_size
 ) {
-    run_retrieval_attention_global<1024>(query, key_cache, value_cache, output, 1);
+    run_retrieval_attention_global<1024>(query, key_cache, value_cache, output, batch_size, 1);
+}
+
+void launch_retrieval_attention_pipelined_32(
+    const half* query,
+    const half* key_cache,
+    const half* value_cache,
+    half* output,
+    int batch_size
+) {
+    run_retrieval_attention_pipelined<32>(query, key_cache, value_cache, output, batch_size, 1);
+}
+
+void launch_retrieval_attention_pipelined_128(
+    const half* query,
+    const half* key_cache,
+    const half* value_cache,
+    half* output,
+    int batch_size
+) {
+    run_retrieval_attention_pipelined<128>(query, key_cache, value_cache, output, batch_size, 1);
+}
+
+void launch_retrieval_attention_pipelined_256(
+    const half* query,
+    const half* key_cache,
+    const half* value_cache,
+    half* output,
+    int batch_size
+) {
+    run_retrieval_attention_pipelined<256>(query, key_cache, value_cache, output, batch_size, 1);
+}
+
+void launch_retrieval_attention_pipelined_512(
+    const half* query,
+    const half* key_cache,
+    const half* value_cache,
+    half* output,
+    int batch_size
+) {
+    run_retrieval_attention_pipelined<512>(query, key_cache, value_cache, output, batch_size, 1);
+}
+
+void launch_retrieval_attention_pipelined_1024(
+    const half* query,
+    const half* key_cache,
+    const half* value_cache,
+    half* output,
+    int batch_size
+) {
+    run_retrieval_attention_pipelined<1024>(query, key_cache, value_cache, output, batch_size, 1);
 }
 #else
 

@@ -21,16 +21,18 @@ ra_ops = load(
 print("Extension loaded.")
 
 def reference_retrieval_attention(q, k, v, topk_per_block):
-    # q: [1, NUM_HEADS, HEAD_DIM]
+    # q: [B, NUM_HEADS, HEAD_DIM]
     # k: [SEQ_LEN, NUM_HEADS, HEAD_DIM]
     # v: [SEQ_LEN, NUM_HEADS, HEAD_DIM]
     
-    # Reshape Q to [NUM_HEADS, 1, HEAD_DIM]
-    q_h = q.squeeze(0).unsqueeze(1) # [H, 1, D]
+    batch_size = q.size(0)
     
-    # Reshape K, V to [NUM_HEADS, SEQ_LEN, HEAD_DIM]
-    k_h = k.permute(1, 0, 2) # [H, N, D]
-    v_h = v.permute(1, 0, 2) # [H, N, D]
+    # Reshape Q to [B, H, 1, D]
+    q_h = q.unsqueeze(2) # [B, H, 1, D]
+    
+    # Reshape K, V to [1, H, N, D] (broadcast over batch)
+    k_h = k.permute(1, 0, 2).unsqueeze(0) # [1, H, N, D]
+    v_h = v.permute(1, 0, 2).unsqueeze(0) # [1, H, N, D]
     
     # Split into blocks
     keys_per_block = SEQ_LEN // QK_BLOCKS_PER_CLUSTER
@@ -43,12 +45,12 @@ def reference_retrieval_attention(q, k, v, topk_per_block):
         end_idx = start_idx + keys_per_block
         
         # Get block K
-        k_block = k_h[:, start_idx:end_idx, :] # [H, BlockSize, D]
+        k_block = k_h[:, :, start_idx:end_idx, :] # [1, H, BlockSize, D]
         
         # Compute scores: Q @ K.T
-        # [H, 1, D] @ [H, D, BlockSize] -> [H, 1, BlockSize]
-        scores = torch.matmul(q_h, k_block.transpose(1, 2))
-        scores = scores.squeeze(1) # [H, BlockSize]
+        # [B, H, 1, D] @ [1, H, D, BlockSize] -> [B, H, 1, BlockSize]
+        scores = torch.matmul(q_h, k_block.transpose(2, 3))
+        scores = scores.squeeze(2) # [B, H, BlockSize]
         
         # Select TopK
         topk_scores, topk_indices = torch.topk(scores, topk_per_block, dim=-1)
@@ -60,55 +62,49 @@ def reference_retrieval_attention(q, k, v, topk_per_block):
         all_topk_indices.append(topk_indices)
         
     # Concatenate all topk
-    # [H, TotalTopK]
-    gathered_scores = torch.cat(all_topk_scores, dim=1)
-    gathered_indices = torch.cat(all_topk_indices, dim=1)
+    # [B, H, TotalTopK]
+    gathered_scores = torch.cat(all_topk_scores, dim=2)
+    gathered_indices = torch.cat(all_topk_indices, dim=2)
     
     # Softmax
-    # Note: The kernel uses hexp directly without subtracting max, 
-    # but for numerical stability in python we usually do.
-    # However, to match kernel exactly we might want to check if we should skip max subtraction.
-    # The kernel does: exp_val = hexp(s_all_scores[i]); sum += exp_val;
-    # So it does NOT subtract max.
-    # But float16 exp can easily overflow. 
-    # Let's try standard softmax first, if it fails we can try raw exp.
-    # Actually, let's try to match the kernel behavior: raw exp.
-    
-    # probs = torch.softmax(gathered_scores, dim=-1) 
     # Using raw exp to match kernel
     exp_scores = torch.exp(gathered_scores)
     sum_exp = exp_scores.sum(dim=-1, keepdim=True)
     probs = exp_scores / sum_exp
     
     # Gather Values
-    # gathered_indices: [H, TotalTopK]
-    # v_h: [H, N, D]
+    # gathered_indices: [B, H, TotalTopK]
+    # v_h: [1, H, N, D]
     
     # We need to gather vectors from v_h using gathered_indices
-    # Expand indices to [H, TotalTopK, D]
-    indices_expanded = gathered_indices.unsqueeze(-1).expand(-1, -1, HEAD_DIM)
-    v_selected = torch.gather(v_h, 1, indices_expanded.long()) # [H, TotalTopK, D]
+    # Expand indices to [B, H, TotalTopK, D]
+    indices_expanded = gathered_indices.unsqueeze(-1).expand(-1, -1, -1, HEAD_DIM)
+    
+    # Expand v_h to [B, H, N, D]
+    v_h_expanded = v_h.expand(batch_size, -1, -1, -1)
+    
+    v_selected = torch.gather(v_h_expanded, 2, indices_expanded.long()) # [B, H, TotalTopK, D]
     
     # Weighted sum
-    # probs: [H, TotalTopK] -> [H, 1, TotalTopK]
-    probs_expanded = probs.unsqueeze(1)
+    # probs: [B, H, TotalTopK] -> [B, H, 1, TotalTopK]
+    probs_expanded = probs.unsqueeze(2)
     
-    # [H, 1, TotalTopK] @ [H, TotalTopK, D] -> [H, 1, D]
+    # [B, H, 1, TotalTopK] @ [B, H, TotalTopK, D] -> [B, H, 1, D]
     output = torch.matmul(probs_expanded, v_selected)
     
-    return output.squeeze(1) # [H, D]
+    return output.squeeze(2) # [B, H, D]
 
-def run_test(topk=128):
-    print(f"\nTesting with TOPK={topk}...")
+def run_test(topk=128, batch_size=4):
+    print(f"\nTesting with TOPK={topk}, BATCH_SIZE={batch_size}...")
     torch.manual_seed(0)
     device = torch.device("cuda")
     
     # Initialize tensors
-    q = torch.randn(1, NUM_HEADS, HEAD_DIM, device=device, dtype=torch.float16) * 0.1
+    q = torch.randn(batch_size, NUM_HEADS, HEAD_DIM, device=device, dtype=torch.float16) * 0.1
     k = torch.randn(SEQ_LEN, NUM_HEADS, HEAD_DIM, device=device, dtype=torch.float16) * 0.1
     v = torch.randn(SEQ_LEN, NUM_HEADS, HEAD_DIM, device=device, dtype=torch.float16) * 0.1
     
-    output_kernel = torch.zeros(1, NUM_HEADS, HEAD_DIM, device=device, dtype=torch.float16)
+    output_kernel = torch.zeros(batch_size, NUM_HEADS, HEAD_DIM, device=device, dtype=torch.float16)
     
     # Run Kernel
     if topk == 32:
@@ -131,10 +127,9 @@ def run_test(topk=128):
     output_ref = reference_retrieval_attention(q, k, v, topk)
     
     # Compare
-    # output_kernel is [1, H, D], output_ref is [H, D]
-    output_kernel_s = output_kernel.squeeze(0)
+    # output_kernel is [B, H, D], output_ref is [B, H, D]
     
-    diff = (output_kernel_s - output_ref).abs()
+    diff = (output_kernel - output_ref).abs()
     max_diff = diff.max().item()
     mean_diff = diff.mean().item()
     
@@ -147,7 +142,7 @@ def run_test(topk=128):
         print("DSM Kernel: FAILED")
 
     # Run Global Kernel
-    output_kernel_global = torch.zeros(1, NUM_HEADS, HEAD_DIM, device=device, dtype=torch.float16)
+    output_kernel_global = torch.zeros(batch_size, NUM_HEADS, HEAD_DIM, device=device, dtype=torch.float16)
     if topk == 32:
         print("Running Global Kernel...")
         ra_ops.retrieval_attention_global_32(q, k, v, output_kernel_global)
@@ -164,8 +159,7 @@ def run_test(topk=128):
         print("Running Global Kernel...")
         ra_ops.retrieval_attention_global_1024(q, k, v, output_kernel_global)
 
-    output_kernel_global_s = output_kernel_global.squeeze(0)
-    diff_global = (output_kernel_global_s - output_ref).abs()
+    diff_global = (output_kernel_global - output_ref).abs()
     max_diff_global = diff_global.max().item()
     mean_diff_global = diff_global.mean().item()
 
@@ -177,9 +171,39 @@ def run_test(topk=128):
     else:
         print("Global Kernel: FAILED")
 
+    # Run Pipelined Kernel
+    output_kernel_pipelined = torch.zeros(batch_size, NUM_HEADS, HEAD_DIM, device=device, dtype=torch.float16)
+    if topk == 32:
+        print("Running Pipelined Kernel...")
+        ra_ops.retrieval_attention_pipelined_32(q, k, v, output_kernel_pipelined)
+    elif topk == 128:
+        print("Running Pipelined Kernel...")
+        ra_ops.retrieval_attention_pipelined_128(q, k, v, output_kernel_pipelined)
+    elif topk == 256:
+        print("Running Pipelined Kernel...")
+        ra_ops.retrieval_attention_pipelined_256(q, k, v, output_kernel_pipelined)
+    elif topk == 512:
+        print("Running Pipelined Kernel...")
+        ra_ops.retrieval_attention_pipelined_512(q, k, v, output_kernel_pipelined)
+    elif topk == 1024:
+        print("Running Pipelined Kernel...")
+        ra_ops.retrieval_attention_pipelined_1024(q, k, v, output_kernel_pipelined)
+
+    diff_pipelined = (output_kernel_pipelined - output_ref).abs()
+    max_diff_pipelined = diff_pipelined.max().item()
+    mean_diff_pipelined = diff_pipelined.mean().item()
+
+    print(f"Pipelined Kernel - Max diff: {max_diff_pipelined}")
+    print(f"Pipelined Kernel - Mean diff: {mean_diff_pipelined}")
+
+    if max_diff_pipelined < 1e-2:
+        print("Pipelined Kernel: PASSED")
+    else:
+        print("Pipelined Kernel: FAILED")
+
 if __name__ == "__main__":
-    run_test(32)
-    run_test(128)
-    run_test(256)
-    run_test(512)
-    run_test(1024)
+    run_test(32, batch_size=4)
+    run_test(128, batch_size=4)
+    run_test(256, batch_size=4)
+    run_test(512, batch_size=4)
+    run_test(1024, batch_size=4)
